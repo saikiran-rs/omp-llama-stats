@@ -1,27 +1,27 @@
 # omp-llama-stats
 
-One status line for local-model speed stats in **oh-my-pi (omp)** (also works in
-**pi**): generation throughput (TPS) and prompt-processing speed (PP) from
-llama.cpp-family servers (LM Studio, llama.cpp server, ...).
+One plain-ASCII status line for local-model speed stats in **oh-my-pi (omp)**
+(also works in **pi**): generation throughput and last-prompt processing speed
+from llama.cpp-family servers (LM Studio, llama.cpp server, ...).
 
 ```
 ...last assistant response line
 
-⚡ TPS: 129.1 tok/s  ·  PP: 72 t/s · 134n · 0c-0.0%
+Gen: 129.1 tok/s | Last Prompt: 72.0 tok/s (no cache)
 ~ (main*) ... lmstudio/big
 ```
 
-- **TPS** — generation tokens/sec, live (1s sliding window) and final (overall average).
-- **PP** — prompt-processing tokens/sec from llama.cpp's SSE progress data, with
-  new-token (`n`) and cache-hit (`c-P%`) counts.
+- **Gen** — generation tokens/sec, live (1s sliding window) and final (overall average).
+- **Last Prompt** — prompt-processing tokens/sec from llama.cpp's SSE progress
+  data, with new-token and cache-hit counts.
 - **Prefill progress** — while the server processes the prompt, the working
   message shows `Prefilling... 42% · 180.3 t/s`.
 - **Top padding** — a blank line between the transcript and the status row
   (omp-specific; see below).
 
-TPS works against any provider. PP appears only for endpoints that support
-llama.cpp's `return_progress` / `timings` fields (LM Studio and the llama.cpp
-server do; hosted APIs don't — the line then shows TPS only).
+Gen works against any provider. Last Prompt appears only for endpoints that
+support llama.cpp's `return_progress` / `timings` fields (LM Studio and the
+llama.cpp server do; hosted APIs don't — it then shows `--`).
 
 ## Install
 
@@ -53,6 +53,33 @@ Uninstall:
 omp plugin uninstall omp-llama-stats
 ```
 
+## Status line format
+
+One line, plain ASCII (no emoji, no ANSI) so it survives copy-paste into
+logs and issue trackers:
+
+```
+Gen: {gen} tok/s | Last Prompt: {pp} tok/s (cache {pct}%, {new} new / {cached} cached)
+```
+
+Rules:
+
+- Rates (`gen`, `pp`) and cache percent: exactly 1 decimal place.
+- `Last Prompt` is per-request, never a rolling average.
+- Token counts: raw integer below 10000; 10000 and above abbreviated with one
+  decimal + lowercase `k` (33398 becomes 33.4k).
+- `cache` pct = cached / (new + cached), rounded to 1 decimal.
+- Cold start (no cached tokens): the parenthetical becomes `(no cache)`.
+- Before the first data arrives: `Gen: -- tok/s | Last Prompt: -- tok/s (no cache)`.
+
+Examples:
+
+```
+Gen: 68.4 tok/s | Last Prompt: 302.0 tok/s (cache 97.3%, 935 new / 33.4k cached)
+Gen: 112.7 tok/s | Last Prompt: 1840.7 tok/s (cache 1.8%, 33.4k new / 599 cached)
+Gen: 94.2 tok/s | Last Prompt: 871.5 tok/s (no cache)
+```
+
 ## Requirements
 
 - omp (any recent build) or pi. The extension imports
@@ -67,9 +94,9 @@ omp plugin uninstall omp-llama-stats
 
 ## How it works (the parts worth reusing)
 
-Single file: `index.ts` (~530 lines, no runtime dependencies).
+Single file: `index.ts` (no runtime dependencies).
 
-### 1. TPS — generation speed
+### 1. Gen — generation speed
 
 Ported from [`pi-token-speed`](https://www.npmjs.com/package/pi-token-speed)
 (0.7.1) at its stock defaults — the `/tps` settings menu is intentionally not
@@ -85,9 +112,7 @@ ported. The engine:
 - `agent_end` reconciles the total against provider-reported `usage.output`
   and switches the display to the overall average.
 
-Colors: red < 15 ≤ orange < 30 ≤ green < 45 ≤ blue tok/s (truecolor ANSI).
-
-### 2. PP — prompt processing via a global fetch hook
+### 2. Last Prompt — prompt processing via a global fetch hook
 
 The only clean seam for reading the raw SSE stream is `globalThis.fetch`
 (extensions run in-process, unsandboxed). The hook:
@@ -97,8 +122,8 @@ The only clean seam for reading the raw SSE stream is `globalThis.fetch`
    `stream_options.include_usage: true` (streaming requests only);
 3. wraps the response body in a tee'd `ReadableStream` that parses SSE lines:
    - `chunk.prompt_progress` → live prefill % + t/s in the working message;
-   - `chunk.timings.prompt_per_second` (+ `prompt_n`, `cache_n`) → the final PP
-     stat, held until the next response;
+   - `chunk.timings.prompt_per_second` (+ `prompt_n`, `cache_n`) → the final
+     Last Prompt stat, held until the next response;
 4. restores `globalThis.fetch` on `session_shutdown`; a `globalThis` guard key
    prevents double-patching when the process hosts multiple sessions.
 
@@ -107,7 +132,7 @@ The only clean seam for reading the raw SSE stream is `globalThis.fetch`
 **omp renders one footer row per `setStatus` key** (pi joins all statuses on
 one line). A TPS plugin and a PP plugin therefore land on two rows in omp.
 The fix: one extension, one status key — `tokenSpeed` — writing
-`⚡ TPS: <x> tok/s  ·  PP: <y> t/s · <n>n · <c>c-<p>%`.
+`Gen: <x> tok/s | Last Prompt: <y> tok/s (cache <p>%, <n> new / <c> cached)`.
 
 If you also have `pi-token-speed` installed, **disable it**
 (`omp plugin disable pi-token-speed`) or the two will fight over the same key.
@@ -117,7 +142,7 @@ If you also have `pi-token-speed` installed, **disable it**
 omp has no spacer between the transcript and the first status row. The
 status-line component maps each status key to its own row, **sorted by key
 (localeCompare)** — so a second, blank status entry whose key sorts first
-(`00-top-pad`) renders as a blank line above the TPS row. Re-asserted on
+(`00-top-pad`) renders a blank line above the status row. Re-asserted on
 `session_start` and `before_agent_start` because session switches clear hook
 statuses. In pi (where statuses are joined on one line) this entry is an
 invisible no-op.
@@ -129,7 +154,6 @@ Everything is a module-level constant in `index.ts`:
 | Constant | Meaning |
 | --- | --- |
 | `SLIDING_WINDOW_MS` | TPS smoothing window (default 1000) |
-| `TPS_THRESHOLDS` | `[tok/s, hex]` color ladder |
 | `TOKEN_GENERATION_TOOLS` | tool names counted as generation (`edit`, `write`) |
 | `STATUS_KEY` / `PAD_KEY` | status keys (rename if another extension collides) |
 
@@ -138,10 +162,10 @@ Everything is a module-level constant in `index.ts`:
 - The fetch hook is process-wide: every session in the omp process routes
   llama-host `/chat/completions` requests through it. Non-llama traffic is
   untouched.
-- PP stats are reported by the *server*; `cache-P%` is prompt-cache hit ratio,
-  not KV-cache memory.
+- Last Prompt stats are reported by the *server*; `cache`% is prompt-cache hit
+  ratio, not KV-cache memory.
 - The extension renders nothing until `session_start`; a placeholder
-  `⚡ TPS: --` appears on session start.
+  `Gen: -- tok/s | Last Prompt: -- tok/s (no cache)` appears on session start.
 
 ## License
 

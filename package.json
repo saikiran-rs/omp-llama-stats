@@ -1,7 +1,7 @@
 {
   "name": "omp-llama-stats",
-  "version": "0.1.0",
-  "description": "Unified TPS + PP (prompt-processing) speed status line for oh-my-pi (omp) and pi with local llama.cpp / LM Studio models",
+  "version": "0.2.0",
+  "description": "Plain-ASCII Gen / Last Prompt (prompt-processing) speed status line for oh-my-pi (omp) and pi with local llama.cpp / LM Studio models",
   "license": "MIT",
   "author": {
     "name": "saikiran-rs",

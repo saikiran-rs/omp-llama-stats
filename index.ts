@@ -1,9 +1,14 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-// Unified speed stats for omp: one status line combining
-//  - TPS: generation tokens/sec (ported from pi-token-speed@0.7.1, stock defaults:
-//    direct counting, 1s sliding window, provider tokens off, average on end)
-//  - PP:  prompt-processing tokens/sec from llama.cpp SSE progress/timings
+// Unified speed stats for omp: one plain-ASCII status line:
+//
+//   Gen: <rate> tok/s | Last Prompt: <rate> tok/s (cache <pct>%, <n> new / <c> cached)
+//
+//  - Gen: generation tokens/sec (ported from pi-token-speed@0.7.1, stock
+//    defaults: direct counting, 1s sliding window, provider tokens off,
+//    average on end)
+//  - Last Prompt: prompt-processing tokens/sec from llama.cpp SSE
+//    progress/timings — per-request, never a rolling average
 //
 // omp renders one footer line per setStatus key, so both metrics must share
 // a single key to appear on one line.
@@ -59,13 +64,6 @@ const TOKEN_GENERATION_TOOLS: Record<string, true> = {
 const SLIDING_WINDOW_MS = 1000;
 const MIN_SLIDING_WINDOW_MS = 100;
 const COMPACTION_THRESHOLD = 5000;
-
-const TPS_THRESHOLDS: Array<[number, string]> = [
-  [45, "#44ddff"], // blazing
-  [30, "#00ff88"], // fast
-  [15, "#ffaa00"], // medium
-  [0, "#ff4444"],  // slow
-];
 
 class SlidingWindow {
   private readonly events: { time: number; tokens: number }[] = [];
@@ -211,7 +209,17 @@ let hasUI = false;
 let llamaHost: string | null = null;
 
 const engine = new TpsEngine();
-let ppStats: string | null = null; // e.g. "452 t/s · 1200n · 800c-40.0%"
+
+interface PpStats {
+  /** prompt tokens/sec (llama.cpp `timings.prompt_per_second`), per-request */
+  pp: number;
+  /** uncached prompt tokens (`timings.prompt_n`) */
+  newTokens: number;
+  /** cached prompt tokens (`timings.cache_n`) */
+  cached: number;
+}
+
+let ppStats: PpStats | null = null;
 
 // Same key pi-token-speed used — pi-token-speed must stay disabled while this
 // extension is active, or both would fight over the same status entry.
@@ -222,45 +230,25 @@ const STATUS_KEY = "tokenSpeed";
 // whose key sorts before STATUS_KEY produces the top padding row.
 const PAD_KEY = "00-top-pad";
 
-function dim(text: string): string {
-  try {
-    return uiRef?.theme?.fg?.("dim", text) ?? `\x1b[90m${text}\x1b[0m`;
-  } catch {
-    return `\x1b[90m${text}\x1b[0m`;
-  }
+function formatTokens(n: number): string {
+  return n < 10000 ? String(n) : `${(n / 1000).toFixed(1)}k`;
 }
 
-function colorHex(text: string, hex: string): string {
-  const r = parseInt(hex.slice(1, 3), 16);
-  const g = parseInt(hex.slice(3, 5), 16);
-  const b = parseInt(hex.slice(5, 7), 16);
-  return `\x1b[38;2;${r};${g};${b}m${text}\x1b[0m`;
-}
-
-function tpsColor(tps: number): string {
-  for (const [threshold, hex] of TPS_THRESHOLDS) {
-    if (tps >= threshold) return hex;
-  }
-  return "";
+function formatPrompt(s: PpStats): string {
+  const rate = `${s.pp.toFixed(1)} tok/s`;
+  if (s.cached === 0) return `${rate} (no cache)`;
+  const total = s.newTokens + s.cached;
+  const pct = total > 0 ? ((s.cached / total) * 100).toFixed(1) : "0.0";
+  return `${rate} (cache ${pct}%, ${formatTokens(s.newTokens)} new / ${formatTokens(s.cached)} cached)`;
 }
 
 function renderStatus(): void {
   if (!uiRef || !hasUI) return;
 
-  let text: string;
-  if (!engine.everStreamed) {
-    text = `${dim("⚡ TPS:")} --`;
-  } else {
-    const tps = engine.tps;
-    const measurement = `${tps.toFixed(1)} tok/s`;
-    text = `${dim("⚡ TPS:")} ${colorHex(measurement, tpsColor(tps))}`;
-  }
+  const gen = engine.everStreamed ? engine.tps.toFixed(1) : "--";
+  const prompt = ppStats ? formatPrompt(ppStats) : "-- tok/s (no cache)";
 
-  if (ppStats) {
-    text += `  ·  ${dim("PP:")} ${ppStats}`;
-  }
-
-  uiRef.setStatus(STATUS_KEY, text);
+  uiRef.setStatus(STATUS_KEY, `Gen: ${gen} tok/s | Last Prompt: ${prompt}`);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -358,20 +346,18 @@ function capture(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
               }
             }
 
-            // Final llama.cpp PP statistics
+            // Final llama.cpp prompt-processing statistics
             if (
               chunk.timings &&
               typeof chunk.timings.prompt_per_second === "number"
             ) {
               const t = chunk.timings;
 
-              const newTokens = t.prompt_n ?? 0;
-              const cached = t.cache_n ?? 0;
-              const totalPrompt = newTokens + cached;
-
-              const cachePct = totalPrompt > 0 ? (cached / totalPrompt) * 100 : 0;
-
-              ppStats = `${Math.floor(t.prompt_per_second)} t/s · ${newTokens}n · ${cached}c-${cachePct.toFixed(1)}%`;
+              ppStats = {
+                pp: t.prompt_per_second,
+                newTokens: t.prompt_n ?? 0,
+                cached: t.cache_n ?? 0,
+              };
               renderStatus();
             }
           } catch {}
@@ -426,7 +412,7 @@ export default function (pi: ExtensionAPI) {
     uiRef = ctx.ui;
     hasUI = ctx.hasUI;
     if (hasUI) {
-      ctx.ui.setStatus(STATUS_KEY, `${dim("⚡ TPS:")} --`);
+      renderStatus();
       ctx.ui.setStatus(PAD_KEY, " ");
     }
   });
