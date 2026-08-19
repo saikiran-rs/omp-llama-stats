@@ -38,11 +38,13 @@ interface MessageUpdateEvent {
 
 interface AgentEndMessage {
   role: string;
+  content?: ToolCallContent[];
   usage?: { output?: number };
 }
 
 interface AgentEndEvent {
   messages?: AgentEndMessage[];
+  willContinue?: boolean;
 }
 
 /** The slice of the extension UI this extension drives. */
@@ -232,6 +234,28 @@ const PAD_KEY = "00-top-pad";
 // Last Prompt rate below this threshold renders red.
 const SLOW_PROMPT_TPS = 15;
 
+// Original pi-token-speed color ladder (stock defaults) for the Gen rate.
+const TPS_THRESHOLDS: Array<[number, string]> = [
+  [45, "#44ddff"], // blazing
+  [30, "#00ff88"], // fast
+  [15, "#ffaa00"], // medium
+  [0, "#ff4444"],  // slow
+];
+
+function colorHex(text: string, hex: string): string {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `\x1b[38;2;${r};${g};${b}m${text}\x1b[0m`;
+}
+
+function tpsColor(tps: number): string {
+  for (const [threshold, hex] of TPS_THRESHOLDS) {
+    if (tps >= threshold) return hex;
+  }
+  return "";
+}
+
 function formatTokens(n: number): string {
   return n < 10000 ? String(n) : `${(n / 1000).toFixed(1)}k`;
 }
@@ -252,9 +276,10 @@ function formatPrompt(s: PpStats): string {
 function renderStatus(): void {
   if (!uiRef || !hasUI) return;
 
-  const gen = engine.everStreamed ? engine.tps.toFixed(1) : "--";
+  const tps = engine.tps;
+  const gen = engine.everStreamed ? colorHex(`${tps.toFixed(1)} tok/s`, tpsColor(tps)) : "-- tok/s";
   const prompt = ppStats ? formatPrompt(ppStats) : "-- tok/s (no cache)";
-  uiRef.setStatus(STATUS_KEY, ` Gen: ${gen} tok/s | Last Prompt: ${prompt}`);
+  uiRef.setStatus(STATUS_KEY, ` Gen: ${gen} | Last Prompt: ${prompt}`);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -471,21 +496,45 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", (event: AgentEndEvent) => {
+    const messages = Array.isArray(event.messages) ? event.messages : [];
+
+    // omp fires agent_end after every assistant-message settle, passing the
+    // FULL session as `messages` — pi fires it once per prompt with the
+    // prompt's messages. A settle whose last assistant message still has tool
+    // calls, or that scheduled a continuation, is mid-prompt: keep the engine
+    // running so the final average spans the whole prompt, and skip the
+    // reconcile (which would otherwise divide a whole-session token total by
+    // the last message's time).
+    let midPrompt = event.willContinue === true;
+    if (!midPrompt) {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role !== "assistant") continue;
+        midPrompt = messages[i].content?.some((c) => c.type === "toolCall") ?? false;
+        break;
+      }
+    }
+    if (midPrompt) return;
+
     engine.stop();
 
-    if (Array.isArray(event.messages)) {
-      const outputTokens = event.messages.reduce((acc, curr) => {
-        if (curr.role === "assistant") {
-          return acc + (curr.usage?.output ?? 0);
-        }
-        if (curr.role === "toolResult") {
-          return acc + (curr.usage?.output ?? 0);
-        }
-        return acc;
-      }, 0);
-
-      engine.reconcileTotal(outputTokens);
+    // Authoritative total for THIS prompt: usage of the messages after the
+    // last user message. In pi that is the original plugin's sum unchanged;
+    // in omp it excludes prior prompts that live in the session state.
+    let start = 0;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user") {
+        start = i + 1;
+        break;
+      }
     }
+    let outputTokens = 0;
+    for (let i = start; i < messages.length; i++) {
+      const m = messages[i];
+      if (m.role === "assistant" || m.role === "toolResult") {
+        outputTokens += m.usage?.output ?? 0;
+      }
+    }
+    engine.reconcileTotal(outputTokens);
 
     renderStatus();
   });

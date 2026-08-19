@@ -72,8 +72,12 @@ Rules:
 - Cold start (no cached tokens): the parenthetical becomes `(no cache)`.
 - Before the first data arrives: ` Gen: -- tok/s | Last Prompt: -- tok/s (no cache)`.
 - The line starts with a single leading space.
-- `Last Prompt` rate below 15 tok/s renders red (truecolor `#ff4444`);
-  otherwise no color.
+- Color is the only non-plain part, and it is dropped on copy:
+  - `Gen` rate: original pi-token-speed ladder — red < 15 ≤ orange < 30 ≤
+    green < 45 ≤ blue tok/s (truecolor).
+  - `Last Prompt` rate: red (`#ff4444`) below 15 tok/s, otherwise no color.
+  - omp's status-line sanitizer strips ANSI and trims the line, so in omp
+    the line renders plain (leading space and colors show in pi).
 
 Examples:
 
@@ -113,7 +117,16 @@ ported. The engine:
 - TPS while streaming = tokens in the last 1000 ms (sliding window, span
   clamped to 100 ms minimum to avoid burst spikes);
 - `agent_end` reconciles the total against provider-reported `usage.output`
-  and switches the display to the overall average.
+  and switches the display to the overall average. omp fires `agent_end`
+  after **every assistant-message settle** with the full session as
+  `messages` (pi fires it once per prompt), so the reconcile runs only on a
+  true prompt end — last assistant message has no tool calls, no
+  continuation scheduled — and sums only the messages after the last user
+  message. Without that guard a whole-session token total divides by the
+  last message's time (the 2080 tok/s bug);
+- Colors: the Gen rate uses the original pi-token-speed ladder —
+  red < 15 ≤ orange < 30 ≤ green < 45 ≤ blue tok/s (truecolor ANSI; stripped
+  by omp's sanitizer, visible in pi).
 
 ### 2. Last Prompt — prompt processing via a global fetch hook
 
@@ -157,6 +170,7 @@ Everything is a module-level constant in `index.ts`:
 | Constant | Meaning |
 | --- | --- |
 | `SLIDING_WINDOW_MS` | TPS smoothing window (default 1000) |
+| `TPS_THRESHOLDS` | `[tok/s, hex]` color ladder for the Gen rate |
 | `TOKEN_GENERATION_TOOLS` | tool names counted as generation (`edit`, `write`) |
 | `STATUS_KEY` / `PAD_KEY` | status keys (rename if another extension collides) |
 
