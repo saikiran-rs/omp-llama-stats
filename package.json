@@ -1,0 +1,29 @@
+{
+  "name": "omp-llama-stats",
+  "version": "0.1.0",
+  "description": "Unified TPS + PP (prompt-processing) speed status line for oh-my-pi (omp) and pi with local llama.cpp / LM Studio models",
+  "license": "MIT",
+  "keywords": [
+    "omp",
+    "oh-my-pi",
+    "pi",
+    "pi-coding-agent",
+    "llama.cpp",
+    "lmstudio",
+    "extension",
+    "status-line",
+    "tokens-per-second",
+    "prompt-processing"
+  ],
+  "omp": {
+    "extensions": ["./index.ts"]
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ]
+}
