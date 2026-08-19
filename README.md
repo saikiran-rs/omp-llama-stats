@@ -7,7 +7,7 @@ from llama.cpp-family servers (LM Studio, llama.cpp server, ...).
 ```
 ...last assistant response line
 
-Gen: 129.1 tok/s | Last Prompt: 72.0 tok/s (no cache)
+ Gen: 129.1 tok/s | Last Prompt: 72.0 tok/s (no cache)
 ~ (main*) ... lmstudio/big
 ```
 
@@ -55,11 +55,11 @@ omp plugin uninstall omp-llama-stats
 
 ## Status line format
 
-One line, plain ASCII (no emoji, no ANSI) so it survives copy-paste into
-logs and issue trackers:
+One line, plain ASCII (no emoji) so it survives copy-paste into logs and
+issue trackers:
 
 ```
-Gen: {gen} tok/s | Last Prompt: {pp} tok/s (cache {pct}%, {new} new / {cached} cached)
+ Gen: {gen} tok/s | Last Prompt: {pp} tok/s (cache {pct}%, {new} new / {cached} cached)
 ```
 
 Rules:
@@ -70,14 +70,17 @@ Rules:
   decimal + lowercase `k` (33398 becomes 33.4k).
 - `cache` pct = cached / (new + cached), rounded to 1 decimal.
 - Cold start (no cached tokens): the parenthetical becomes `(no cache)`.
-- Before the first data arrives: `Gen: -- tok/s | Last Prompt: -- tok/s (no cache)`.
+- Before the first data arrives: ` Gen: -- tok/s | Last Prompt: -- tok/s (no cache)`.
+- The line starts with a single leading space.
+- `Last Prompt` rate below 15 tok/s renders red (truecolor `#ff4444`);
+  otherwise no color.
 
 Examples:
 
 ```
-Gen: 68.4 tok/s | Last Prompt: 302.0 tok/s (cache 97.3%, 935 new / 33.4k cached)
-Gen: 112.7 tok/s | Last Prompt: 1840.7 tok/s (cache 1.8%, 33.4k new / 599 cached)
-Gen: 94.2 tok/s | Last Prompt: 871.5 tok/s (no cache)
+ Gen: 68.4 tok/s | Last Prompt: 302.0 tok/s (cache 97.3%, 935 new / 33.4k cached)
+ Gen: 112.7 tok/s | Last Prompt: 1840.7 tok/s (cache 1.8%, 33.4k new / 599 cached)
+ Gen: 94.2 tok/s | Last Prompt: 871.5 tok/s (no cache)
 ```
 
 ## Requirements
@@ -132,7 +135,7 @@ The only clean seam for reading the raw SSE stream is `globalThis.fetch`
 **omp renders one footer row per `setStatus` key** (pi joins all statuses on
 one line). A TPS plugin and a PP plugin therefore land on two rows in omp.
 The fix: one extension, one status key — `tokenSpeed` — writing
-`Gen: <x> tok/s | Last Prompt: <y> tok/s (cache <p>%, <n> new / <c> cached)`.
+` Gen: <x> tok/s | Last Prompt: <y> tok/s (cache <p>%, <n> new / <c> cached)`.
 
 If you also have `pi-token-speed` installed, **disable it**
 (`omp plugin disable pi-token-speed`) or the two will fight over the same key.
@@ -165,7 +168,7 @@ Everything is a module-level constant in `index.ts`:
 - Last Prompt stats are reported by the *server*; `cache`% is prompt-cache hit
   ratio, not KV-cache memory.
 - The extension renders nothing until `session_start`; a placeholder
-  `Gen: -- tok/s | Last Prompt: -- tok/s (no cache)` appears on session start.
+  ` Gen: -- tok/s | Last Prompt: -- tok/s (no cache)` appears on session start.
 
 ## License
 

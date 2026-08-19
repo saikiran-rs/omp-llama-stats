@@ -229,13 +229,20 @@ const STATUS_KEY = "tokenSpeed";
 // no spacer between the transcript and the first status line. A blank entry
 // whose key sorts before STATUS_KEY produces the top padding row.
 const PAD_KEY = "00-top-pad";
+// Last Prompt rate below this threshold renders red.
+const SLOW_PROMPT_TPS = 15;
 
 function formatTokens(n: number): string {
   return n < 10000 ? String(n) : `${(n / 1000).toFixed(1)}k`;
 }
 
+function promptRate(pp: number): string {
+  const text = `${pp.toFixed(1)} tok/s`;
+  return pp < SLOW_PROMPT_TPS ? `\x1b[38;2;255;68;68m${text}\x1b[0m` : text;
+}
+
 function formatPrompt(s: PpStats): string {
-  const rate = `${s.pp.toFixed(1)} tok/s`;
+  const rate = promptRate(s.pp);
   if (s.cached === 0) return `${rate} (no cache)`;
   const total = s.newTokens + s.cached;
   const pct = total > 0 ? ((s.cached / total) * 100).toFixed(1) : "0.0";
@@ -247,8 +254,7 @@ function renderStatus(): void {
 
   const gen = engine.everStreamed ? engine.tps.toFixed(1) : "--";
   const prompt = ppStats ? formatPrompt(ppStats) : "-- tok/s (no cache)";
-
-  uiRef.setStatus(STATUS_KEY, `Gen: ${gen} tok/s | Last Prompt: ${prompt}`);
+  uiRef.setStatus(STATUS_KEY, ` Gen: ${gen} tok/s | Last Prompt: ${prompt}`);
 }
 
 // ═══════════════════════════════════════════════════════════════

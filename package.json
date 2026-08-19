@@ -1,6 +1,6 @@
 {
   "name": "omp-llama-stats",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Plain-ASCII Gen / Last Prompt (prompt-processing) speed status line for oh-my-pi (omp) and pi with local llama.cpp / LM Studio models",
   "license": "MIT",
   "author": {
