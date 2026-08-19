@@ -31,6 +31,14 @@ omp (from git, no npm account needed):
 omp plugin install github:saikiran-rs/omp-llama-stats
 ```
 
+The installer shells out to `bun` to resolve the git source, so it must be in
+`$PATH` (error: `Executable not found in $PATH: "bun"` otherwise). If
+missing:
+
+```
+curl -fsSL https://bun.sh/install | bash   # installs to ~/.bun/bin
+```
+
 pi:
 
 ```
@@ -50,6 +58,8 @@ omp plugin uninstall omp-llama-stats
 - omp (any recent build) or pi. The extension imports
   `@earendil-works/pi-coding-agent` types only; omp's pi-compat layer rewrites
   the specifier onto its bundled host copy, so no dependency install is needed.
+- `bun` in `$PATH` at install time (the omp installer uses it to fetch the
+  git source). Not needed at runtime — the extension is dependency-free.
 - For PP: an OpenAI-compatible endpoint that accepts
   `return_progress: true` (LM Studio `http://<host>:1234/v1`,
   llama.cpp `llama-server`). The endpoint host is auto-detected from the first
