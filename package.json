@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "description": "Unified TPS + PP (prompt-processing) speed status line for oh-my-pi (omp) and pi with local llama.cpp / LM Studio models",
   "license": "MIT",
+  "author": {
+    "name": "saikiran-rs",
+    "url": "https://github.com/saikiran-rs"
+  },
   "keywords": [
     "omp",
     "oh-my-pi",
