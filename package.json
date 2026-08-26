@@ -19,6 +19,9 @@
     "tokens-per-second",
     "prompt-processing"
   ],
+  "scripts": {
+    "test": "bun test/e2e.ts"
+  },
   "omp": {
     "extensions": ["./index.ts"]
   },

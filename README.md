@@ -213,6 +213,13 @@ without it, local/private hosts match per request.
 - The extension renders nothing until `session_start`; a placeholder
   ` ⚡ Gen -- t/s | Last Prompt -- t/s` appears on session start.
 
+## Testing
+
+`bun test` — runs the e2e harness (`test/e2e.ts`): imports the real
+extension and drives it against a mock llama.cpp SSE server on 127.0.0.1
+(body injection, byte pass-through, live and final status lines, fetch
+teardown). Requires bun.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
