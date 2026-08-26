@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // Unified speed stats for omp: one plain-ASCII status line:
 //
-//   ⚡ Gen: <rate> tok/s | Last Prompt: <rate> tok/s (cache <pct>%, <n> new / <c> cached)
+//   ⚡ Gen <rate> t/s | Last Prompt <rate> t/s [Cache <pct>% | <n> new / <c> cached]
 //
 //  - Gen: generation tokens/sec (ported from pi-token-speed@0.7.1, stock
 //    defaults: direct counting, 1s sliding window, provider tokens off,
@@ -256,30 +256,35 @@ function tpsColor(tps: number): string {
   return "";
 }
 
+function formatRate(v: number): string {
+  return `${v.toFixed(1).replace(/\.0$/, "")} t/s`;
+}
+
 function formatTokens(n: number): string {
-  return n < 10000 ? String(n) : `${(n / 1000).toFixed(1)}k`;
+  if (n < 1000) return String(n);
+  return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}K`;
 }
 
 function promptRate(pp: number): string {
-  const text = `${pp.toFixed(1)} tok/s`;
+  const text = formatRate(pp);
   return pp < SLOW_PROMPT_TPS ? `\x1b[38;2;255;68;68m${text}\x1b[0m` : text;
 }
 
 function formatPrompt(s: PpStats): string {
   const rate = promptRate(s.pp);
-  if (s.cached === 0) return `${rate} (no cache)`;
+  if (s.cached === 0) return rate;
   const total = s.newTokens + s.cached;
   const pct = total > 0 ? ((s.cached / total) * 100).toFixed(1) : "0.0";
-  return `${rate} (cache ${pct}%, ${formatTokens(s.newTokens)} new / ${formatTokens(s.cached)} cached)`;
+  return `${rate} [Cache ${pct}% | ${formatTokens(s.newTokens)} new / ${formatTokens(s.cached)} cached]`;
 }
 
 function renderStatus(): void {
   if (!uiRef || !hasUI) return;
 
   const tps = engine.tps;
-  const gen = engine.everStreamed ? colorHex(`${tps.toFixed(1)} tok/s`, tpsColor(tps)) : "-- tok/s";
-  const prompt = ppStats ? formatPrompt(ppStats) : "-- tok/s (no cache)";
-  uiRef.setStatus(STATUS_KEY, ` ⚡ Gen: ${gen} | Last Prompt: ${prompt}`);
+  const gen = engine.everStreamed ? colorHex(formatRate(tps), tpsColor(tps)) : "-- t/s";
+  const prompt = ppStats ? formatPrompt(ppStats) : "-- t/s";
+  uiRef.setStatus(STATUS_KEY, ` ⚡ Gen ${gen} | Last Prompt ${prompt}`);
 }
 
 // ═══════════════════════════════════════════════════════════════
