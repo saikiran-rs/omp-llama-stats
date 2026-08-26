@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // Unified speed stats for omp: one plain-ASCII status line:
 //
-//   Gen: <rate> tok/s | Last Prompt: <rate> tok/s (cache <pct>%, <n> new / <c> cached)
+//   ⚡ Gen: <rate> tok/s | Last Prompt: <rate> tok/s (cache <pct>%, <n> new / <c> cached)
 //
 //  - Gen: generation tokens/sec (ported from pi-token-speed@0.7.1, stock
 //    defaults: direct counting, 1s sliding window, provider tokens off,
@@ -279,7 +279,7 @@ function renderStatus(): void {
   const tps = engine.tps;
   const gen = engine.everStreamed ? colorHex(`${tps.toFixed(1)} tok/s`, tpsColor(tps)) : "-- tok/s";
   const prompt = ppStats ? formatPrompt(ppStats) : "-- tok/s (no cache)";
-  uiRef.setStatus(STATUS_KEY, ` Gen: ${gen} | Last Prompt: ${prompt}`);
+  uiRef.setStatus(STATUS_KEY, ` ⚡ Gen: ${gen} | Last Prompt: ${prompt}`);
 }
 
 // ═══════════════════════════════════════════════════════════════
