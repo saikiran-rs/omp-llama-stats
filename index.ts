@@ -1,12 +1,13 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-// Unified speed stats for omp: one plain-ASCII status line:
+// Unified speed stats for omp: one status line:
 //
 //   ⚡ Gen <rate> t/s | Last Prompt <rate> t/s [Cache <pct>% | <n> new / <c> cached]
 //
-//  - Gen: generation tokens/sec (ported from pi-token-speed@0.7.1, stock
-//    defaults: direct counting, 1s sliding window, provider tokens off,
-//    average on end)
+//  - Gen: generation tokens/sec. Live: 1s sliding-window estimate (ported
+//    from pi-token-speed@0.7.1). Final: llama.cpp's own
+//    `timings.predicted_n` / `predicted_ms` summed per prompt, with a
+//    wall-clock average fallback for non-llama providers
 //  - Last Prompt: prompt-processing tokens/sec from llama.cpp SSE
 //    progress/timings — per-request, never a rolling average
 //
@@ -55,13 +56,8 @@ interface UiRef {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// TPS engine (port of pi-token-speed, defaults only)
+// TPS engine (port of pi-token-speed; divergences noted in the README)
 // ═══════════════════════════════════════════════════════════════
-
-const TOKEN_GENERATION_TOOLS: Record<string, true> = {
-  edit: true,
-  write: true,
-};
 
 const SLIDING_WINDOW_MS = 1000;
 const MIN_SLIDING_WINDOW_MS = 100;
@@ -79,8 +75,8 @@ class SlidingWindow {
   }
 
   getTps(now: number): number {
-    if (this.events.length === 0) return 0;
-
+    // N tokens span N-1 complete generation intervals; the oldest in-window
+    // token anchors the span, so count only tokens after it.
     const windowStart = now - this.windowMs;
     while (
       this.windowStartIndex < this.events.length &&
@@ -88,16 +84,15 @@ class SlidingWindow {
     ) {
       this.windowStartIndex++;
     }
-    if (this.windowStartIndex >= this.events.length) return 0;
+    if (this.events.length - this.windowStartIndex < 2) return 0;
 
     let windowTokenCount = 0;
-    for (let i = this.windowStartIndex; i < this.events.length; i++) {
+    for (let i = this.windowStartIndex + 1; i < this.events.length; i++) {
       windowTokenCount += this.events[i].tokens;
     }
     if (windowTokenCount === 0) return 0;
 
-    const rawSpan = now - this.events[this.windowStartIndex].time;
-    const span = Math.max(rawSpan, MIN_SLIDING_WINDOW_MS);
+    const span = Math.max(now - this.events[this.windowStartIndex].time, MIN_SLIDING_WINDOW_MS);
     return (1000 * windowTokenCount) / span;
   }
 
@@ -121,7 +116,6 @@ class TpsEngine {
   private _endTime = 0;
   private _startPause = 0;
   private _pausedMs = 0;
-  private _tps = 0;
   private _everStreamed = false;
   private readonly _slidingWindow = new SlidingWindow(SLIDING_WINDOW_MS);
 
@@ -145,7 +139,10 @@ class TpsEngine {
 
   get tps(): number {
     // endTpsBehavior: "average" — overall average once streaming ends
-    if (this.isStreaming) return this._tps;
+    // (renderStatus substitutes llama.cpp's exact predicted rate when it
+    // has one). Live: computed at read time so a stalled stream decays
+    // toward 0 instead of pinning the last delta's value.
+    if (this.isStreaming) return this._slidingWindow.getTps(Date.now());
     return this.tpsAvg;
   }
 
@@ -160,19 +157,25 @@ class TpsEngine {
     this._tokenCount = 0;
     this._isStreaming = true;
     this._startTime = Date.now();
-    this._endTime = Date.now();
+    this._endTime = this._startTime;
     this._slidingWindow.reset();
-    this._tps = 0;
     this._pausedMs = 0;
+    // A pause left open by the previous prompt must not leak into this one.
+    this._isPaused = false;
+    this._startPause = 0;
   }
 
   stop(): void {
+    // Settle an open pause before freezing elapsed time.
+    this.resume();
     this._isStreaming = false;
     this._endTime = Date.now();
     this._slidingWindow.reset();
   }
 
   pause(): void {
+    // Ignore re-pause (parallel tool calls) and pauses outside streaming.
+    if (!this._isStreaming || this._isPaused) return;
     this._isPaused = true;
     this._startPause = Date.now();
   }
@@ -197,7 +200,6 @@ class TpsEngine {
     if (!this._isStreaming || tokens <= 0) return;
     this._tokenCount += tokens;
     this._slidingWindow.record(tokens);
-    this._tps = this._slidingWindow.getTps(Date.now());
   }
 }
 
@@ -208,7 +210,10 @@ class TpsEngine {
 let originalFetch: typeof fetch | null = null;
 let uiRef: UiRef | null = null;
 let hasUI = false;
-let llamaHost: string | null = null;
+// Explicit pin for the llama.cpp host (e.g. "127.0.0.1:8080") when proxying;
+// without it, only local/private hosts are treated as llama.cpp.
+const LLAMA_HOST: string | null =
+  ((globalThis as Record<string, any>).process?.env?.OMP_LLAMA_HOST as string) ?? null;
 
 const engine = new TpsEngine();
 
@@ -222,6 +227,12 @@ interface PpStats {
 }
 
 let ppStats: PpStats | null = null;
+// Exact generation timing from llama.cpp `timings.predicted_n` /
+// `predicted_ms`, accumulated across the requests of one user prompt
+// (reset in before_agent_start).
+let tgAccum = { n: 0, ms: 0 };
+// Warn once per process when a llama.cpp build predates `timings.cache_n`.
+let warnedMissingCacheN = false;
 
 // Same key pi-token-speed used — pi-token-speed must stay disabled while this
 // extension is active, or both would fight over the same status entry.
@@ -243,6 +254,7 @@ const TPS_THRESHOLDS: Array<[number, string]> = [
 ];
 
 function colorHex(text: string, hex: string): string {
+  if (!/^#[0-9a-fA-F]{6}$/.test(hex)) return text;
   const r = parseInt(hex.slice(1, 3), 16);
   const g = parseInt(hex.slice(3, 5), 16);
   const b = parseInt(hex.slice(5, 7), 16);
@@ -271,17 +283,46 @@ function promptRate(pp: number): string {
 }
 
 function formatPrompt(s: PpStats): string {
+  const total = s.newTokens + s.cached;
+  if (s.newTokens === 0 && s.cached > 0) {
+    // Fully-cached prompt: nothing ran through the model, so a rate would
+    // be 0 — and red. Show the hit directly.
+    return `cached [${formatTokens(s.cached)}]`;
+  }
   const rate = promptRate(s.pp);
   if (s.cached === 0) return rate;
-  const total = s.newTokens + s.cached;
   const pct = total > 0 ? ((s.cached / total) * 100).toFixed(1) : "0.0";
   return `${rate} [Cache ${pct}% | ${formatTokens(s.newTokens)} new / ${formatTokens(s.cached)} cached]`;
 }
 
-function renderStatus(): void {
+const RENDER_INTERVAL_MS = 100;
+let lastRender = 0;
+let renderTimer: ReturnType<typeof setTimeout> | null = null;
+
+function renderStatus(force = false): void {
   if (!uiRef || !hasUI) return;
 
-  const tps = engine.tps;
+  // Throttle per-token repaints; a trailing flush keeps the final value fresh.
+  const now = Date.now();
+  if (!force && now - lastRender < RENDER_INTERVAL_MS) {
+    renderTimer ??= setTimeout(() => {
+      renderTimer = null;
+      renderStatus(true);
+    }, RENDER_INTERVAL_MS - (now - lastRender));
+    return;
+  }
+
+  if (renderTimer) {
+    clearTimeout(renderTimer);
+    renderTimer = null;
+  }
+  lastRender = now;
+
+  // After the prompt ends, prefer the server-measured rate (ground truth)
+  // over the wall-clock reconstruction; while streaming, the live estimate
+  // is the only in-flight source.
+  const tps =
+    !engine.isStreaming && tgAccum.ms > 0 ? (1000 * tgAccum.n) / tgAccum.ms : engine.tps;
   const gen = engine.everStreamed ? colorHex(formatRate(tps), tpsColor(tps)) : "-- t/s";
   const prompt = ppStats ? formatPrompt(ppStats) : "-- t/s";
   uiRef.setStatus(STATUS_KEY, ` ⚡ Gen ${gen} | Last Prompt ${prompt}`);
@@ -291,28 +332,29 @@ function renderStatus(): void {
 // llama.cpp SSE hook (unchanged from the pi version)
 // ═══════════════════════════════════════════════════════════════
 
+// Local/private match per request so a cloud provider (or a proxy fronting
+// one) never gets `return_progress` injected — OpenAI 400s on it.
+function isLocalHost(host: string): boolean {
+  const name = host.replace(/:\d+$/, "").replace(/^\[|\]$/g, "").toLowerCase();
+  return (
+    name === "localhost" ||
+    name === "::1" ||
+    name.endsWith(".local") ||
+    /^127\./.test(name) ||
+    /^10\./.test(name) ||
+    /^192\.168\./.test(name) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(name)
+  );
+}
+
 function isLlamaRequest(input: RequestInfo | URL): boolean {
-  const url =
-    typeof input === "string"
-      ? input
-      : input instanceof URL
-        ? input.href
-        : input.url;
-
-  if (typeof url !== "string" || !url.includes("/chat/completions")) {
-    return false;
-  }
-
-  if (!llamaHost) {
-    try {
-      llamaHost = new URL(url).host;
-    } catch {
-      return false;
-    }
-  }
+  const raw =
+    typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  if (typeof raw !== "string" || !raw.includes("/chat/completions")) return false;
 
   try {
-    return new URL(url).host === llamaHost;
+    const host = new URL(raw).host;
+    return LLAMA_HOST ? host === LLAMA_HOST : isLocalHost(host);
   } catch {
     return false;
   }
@@ -339,74 +381,76 @@ function capture(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
   const decoder = new TextDecoder();
   let buffer = "";
 
-  return new ReadableStream<Uint8Array>({
-    async start(controller) {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+  const handleLine = (line: string) => {
+    if (!line.startsWith("data: ")) return;
+    const raw = line.slice(6).trim();
+    if (!raw || raw === "[DONE]") return;
 
-        buffer += decoder.decode(value, { stream: true });
+    try {
+      const chunk = JSON.parse(raw);
 
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
+      // Live prefill display
+      if (chunk.prompt_progress && uiRef && hasUI) {
+        const p = chunk.prompt_progress;
+        const processed = p.processed ?? 0;
+        const cached = p.cache ?? 0;
+        const total = p.total ?? 0;
+        const ms = p.time_ms ?? 0;
 
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
+        const newTokens = Math.max(0, processed - cached);
+        const totalNew = Math.max(0, total - cached);
+        const pp = ms > 0 ? newTokens / (ms / 1000) : 0;
+        const pct = totalNew > 0 ? (newTokens / totalNew) * 100 : 100;
 
-          const raw = line.slice(6);
-          if (raw === "[DONE]") continue;
-
-          try {
-            const chunk = JSON.parse(raw);
-
-            // Live prefill display
-            if (chunk.prompt_progress && uiRef && hasUI) {
-              const p = chunk.prompt_progress;
-
-              const processed = p.processed ?? 0;
-              const cached = p.cache ?? 0;
-              const total = p.total ?? 0;
-              const ms = p.time_ms ?? 0;
-
-              const newTokens = Math.max(0, processed - cached);
-              const totalNew = Math.max(0, total - cached);
-
-              const pp = ms > 0 ? newTokens / (ms / 1000) : 0;
-
-              const pct = totalNew > 0 ? (newTokens / totalNew) * 100 : 100;
-
-              if (processed < total) {
-                uiRef.setWorkingMessage(`Prefilling... ${pct.toFixed(0)}% · ${pp.toFixed(1)} t/s`);
-              } else {
-                uiRef.setWorkingMessage();
-              }
-            }
-
-            // Final llama.cpp prompt-processing statistics
-            if (
-              chunk.timings &&
-              typeof chunk.timings.prompt_per_second === "number"
-            ) {
-              const t = chunk.timings;
-
-              ppStats = {
-                pp: t.prompt_per_second,
-                newTokens: t.prompt_n ?? 0,
-                cached: t.cache_n ?? 0,
-              };
-              renderStatus();
-            }
-          } catch {}
+        if (processed < total) {
+          uiRef.setWorkingMessage(`Prefilling... ${pct.toFixed(0)}% · ${pp.toFixed(1)} t/s`);
+        } else {
+          uiRef.setWorkingMessage();
         }
-
-        controller.enqueue(value);
       }
 
-      controller.close();
-    },
+      // Final llama.cpp statistics
+      if (chunk.timings && typeof chunk.timings.prompt_per_second === "number") {
+        const t = chunk.timings;
+        ppStats = {
+          pp: t.prompt_per_second,
+          newTokens: t.prompt_n ?? 0,
+          cached: t.cache_n ?? 0,
+        };
+        if (t.cache_n === undefined && !warnedMissingCacheN) {
+          warnedMissingCacheN = true;
+          console.warn(
+            "[omp-llama-stats] llama.cpp timings.cache_n missing (older build?) — cache stats will read as absent",
+          );
+        }
+        if (typeof t.predicted_n === "number" && typeof t.predicted_ms === "number") {
+          tgAccum.n += t.predicted_n;
+          tgAccum.ms += t.predicted_ms;
+        }
+        renderStatus(true);
+      }
+    } catch {}
+  };
 
+  // Pull-based: the consumer drives the pace (backpressure), and cancel
+  // propagates so a torn-down stream can't reject an already-settled one.
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) {
+        controller.close();
+        return;
+      }
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) handleLine(line);
+
+      controller.enqueue(value);
+    },
     cancel(reason) {
-      reader.cancel(reason);
+      return reader.cancel(reason);
     },
   });
 }
@@ -424,7 +468,7 @@ export default function (pi: ExtensionAPI) {
 
   originalFetch = globalThis.fetch;
 
-  globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+  const patched = async (input: RequestInfo | URL, init?: RequestInit) => {
     if (!isLlamaRequest(input)) {
       return originalFetch!(input, init);
     }
@@ -443,12 +487,13 @@ export default function (pi: ExtensionAPI) {
 
     return response;
   };
+  globalThis.fetch = patched;
 
   pi.on("session_start", (_event, ctx) => {
     uiRef = ctx.ui;
     hasUI = ctx.hasUI;
     if (hasUI) {
-      renderStatus();
+      renderStatus(true);
       ctx.ui.setStatus(PAD_KEY, " ");
     }
   });
@@ -456,6 +501,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", (_event, ctx) => {
     uiRef = ctx.ui;
     hasUI = ctx.hasUI;
+    // New user prompt: the exact-generation accumulator starts fresh.
+    tgAccum = { n: 0, ms: 0 };
     if (hasUI) {
       ctx.ui.setStatus(PAD_KEY, " ");
     }
@@ -483,20 +530,17 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (ev.type === "toolcall_delta") {
-      const toolCall = ev.partial?.content?.[ev.contentIndex ?? 0];
-      if (toolCall?.type === "toolCall" && TOKEN_GENERATION_TOOLS[toolCall.name ?? ""]) {
-        engine.recordDelta();
-        renderStatus();
-      }
+      // Count all tool-call argument tokens: usage.output includes them, so
+      // the counted total and the clock must agree on what was generated.
+      engine.recordDelta();
+      renderStatus();
       return;
     }
 
     if (ev.type === "toolcall_end") {
-      const toolCall = ev.partial?.content?.[ev.contentIndex ?? 0];
-      if (toolCall?.type === "toolCall" && !TOKEN_GENERATION_TOOLS[toolCall.name ?? ""]) {
-        // Pause the timer for prompt-processing tools so they don't skew the average
-        engine.pause();
-      }
+      // Pause covers exactly the dead time — tool execution + next prefill,
+      // from the last tool-call token to the next message's first token.
+      engine.pause();
     }
   });
 
@@ -541,7 +585,7 @@ export default function (pi: ExtensionAPI) {
     }
     engine.reconcileTotal(outputTokens);
 
-    renderStatus();
+    renderStatus(true);
   });
 
   pi.on("turn_end", (_event, ctx) => {
@@ -552,9 +596,13 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", () => {
     engine.stop();
-    if (originalFetch) {
-      globalThis.fetch = originalFetch;
+    if (renderTimer) {
+      clearTimeout(renderTimer);
+      renderTimer = null;
     }
+    // Only restore if our wrapper is still on top — never clobber a wrapper
+    // installed by another extension after us.
+    if (originalFetch && globalThis.fetch === patched) globalThis.fetch = originalFetch;
     delete globalState[key];
   });
 }

@@ -11,7 +11,8 @@ from llama.cpp-family servers (LM Studio, llama.cpp server, ...).
 ~ (main*) ... lmstudio/big
 ```
 
-- **Gen** — generation tokens/sec, live (1s sliding window) and final (overall average).
+- **Gen** — generation tokens/sec, live (1s sliding window) and final
+  (llama.cpp's measured predicted rate; wall-clock average fallback).
 - **Last Prompt** — prompt-processing tokens/sec from llama.cpp's SSE progress
   data, with new-token and cache-hit counts.
 - **Prefill progress** — while the server processes the prompt, the working
@@ -60,6 +61,7 @@ issue trackers:
 
 ```
  ⚡ Gen {gen} t/s | Last Prompt {pp} t/s [Cache {pct}% | {new} new / {cached} cached]
+ ⚡ Gen {gen} t/s | Last Prompt cached [{cached}]        (fully-cached prompt)
 ```
 
 Rules:
@@ -72,6 +74,7 @@ Rules:
   becomes 33.4K).
 - `Cache` pct = cached / (new + cached), rounded to 1 decimal.
 - Cold start (no cached tokens): the cache bracket is omitted — bare rate.
+- Fully-cached prompt (nothing to process): no rate — `cached [N]`.
 - Before the first data arrives: ` ⚡ Gen -- t/s | Last Prompt -- t/s`.
 - The line starts with a single leading space.
 - Color is the only non-plain part, and it is dropped on copy:
@@ -87,6 +90,7 @@ Examples:
  ⚡ Gen 68.4 t/s | Last Prompt 302 t/s [Cache 97.3% | 935 new / 33.4K cached]
  ⚡ Gen 112.7 t/s | Last Prompt 1840.7 t/s [Cache 1.8% | 33.4K new / 599 cached]
  ⚡ Gen 94.2 t/s | Last Prompt 871.5 t/s
+ ⚡ Gen 12.3 t/s | Last Prompt cached [26K]
 ```
 
 ## Requirements
@@ -98,8 +102,10 @@ Examples:
   git source). Not needed at runtime — the extension is dependency-free.
 - For PP: an OpenAI-compatible endpoint that accepts
   `return_progress: true` (LM Studio `http://<host>:1234/v1`,
-  llama.cpp `llama-server`). The endpoint host is auto-detected from the first
-  `/chat/completions` request and pinned.
+  llama.cpp `llama-server`). Only local/private hosts (localhost, 127.*,
+  10.*, 192.168.*, 172.16-31.*, *.local, ::1) are treated as llama.cpp —
+  cloud providers never get `return_progress` injected (OpenAI 400s on it).
+  Set `OMP_LLAMA_HOST=host:port` to pin an explicit host.
 
 ## How it works (the parts worth reusing)
 
@@ -108,18 +114,24 @@ Single file: `index.ts` (no runtime dependencies).
 ### 1. Gen — generation speed
 
 Ported from [`pi-token-speed`](https://www.npmjs.com/package/pi-token-speed)
-(0.7.1) at its stock defaults — the `/tps` settings menu is intentionally not
-ported. The engine:
+(0.7.1), diverged where estimation mattered — the `/tps` settings menu is
+intentionally not ported. The engine:
 
 - listens to `message_update` events: `text_start`/`thinking_start`/
-  `toolcall_start` start a stream; `text_delta`/`thinking_delta` record 1 token
-  each (`direct` count strategy); tool-call deltas count only for
-  `edit`/`write` (the token-generating tools); other tool calls `pause()` the
-  timer so tool execution time doesn't skew the average;
-- TPS while streaming = tokens in the last 1000 ms (sliding window, span
-  clamped to 100 ms minimum to avoid burst spikes);
+  `toolcall_start` start a stream; `text_delta`/`thinking_delta`/
+  `toolcall_delta` each record 1 token (`direct` count strategy) — tool-call
+  argument tokens are counted because `usage.output` includes them; every
+  `toolcall_end` `pause()`s the timer, so the excluded time is exactly the
+  dead gap (tool execution + next prefill);
+- live TPS while streaming = tokens in the last 1000 ms (sliding window,
+  span clamped to 100 ms minimum to avoid burst spikes), computed at read
+  time so a stalled stream decays instead of pinning;
+- **final** Gen prefers llama.cpp's own measurement: `timings.predicted_n` /
+  `predicted_ms` (server-side sampling-loop timing) accumulated across the
+  prompt's requests — exact, immune to pause bookkeeping and network jitter.
+  Wall-clock average is the fallback for non-llama providers;
 - `agent_end` reconciles the total against provider-reported `usage.output`
-  and switches the display to the overall average. omp fires `agent_end`
+  and switches the display to the final value. omp fires `agent_end`
   after **every assistant-message settle** with the full session as
   `messages` (pi fires it once per prompt), so the reconcile runs only on a
   true prompt end — last assistant message has no tool calls, no
@@ -135,15 +147,22 @@ ported. The engine:
 The only clean seam for reading the raw SSE stream is `globalThis.fetch`
 (extensions run in-process, unsandboxed). The hook:
 
-1. matches requests to `<auto-detected host>/chat/completions`;
+1. matches `/chat/completions` requests to local/private hosts per request
+   (`OMP_LLAMA_HOST` pins one host) — cloud providers are never touched;
 2. rewrites the JSON body: `return_progress: true` +
    `stream_options.include_usage: true` (streaming requests only);
-3. wraps the response body in a tee'd `ReadableStream` that parses SSE lines:
+3. wraps the response body in a pull-based `ReadableStream` (consumer-paced,
+   cancel propagates) that parses SSE lines:
    - `chunk.prompt_progress` → live prefill % + t/s in the working message;
    - `chunk.timings.prompt_per_second` (+ `prompt_n`, `cache_n`) → the final
-     Last Prompt stat, held until the next response;
-4. restores `globalThis.fetch` on `session_shutdown`; a `globalThis` guard key
-   prevents double-patching when the process hosts multiple sessions.
+     Last Prompt stat, held until the next response; missing `cache_n`
+     (older llama.cpp) warns once and reads as no cache;
+   - `chunk.timings.predicted_n` / `predicted_ms` → accumulated into the
+     exact final Gen rate;
+4. restores `globalThis.fetch` on `session_shutdown` — only if our wrapper
+   is still on top, so a later extension's wrapper survives; a `globalThis`
+   guard key prevents double-patching when the process hosts multiple
+   sessions.
 
 ### 3. Single line (why this exists)
 
@@ -173,8 +192,10 @@ Everything is a module-level constant in `index.ts`:
 | --- | --- |
 | `SLIDING_WINDOW_MS` | TPS smoothing window (default 1000) |
 | `TPS_THRESHOLDS` | `[t/s, hex]` color ladder for the Gen rate |
-| `TOKEN_GENERATION_TOOLS` | tool names counted as generation (`edit`, `write`) |
 | `STATUS_KEY` / `PAD_KEY` | status keys (rename if another extension collides) |
+
+Env: `OMP_LLAMA_HOST` (e.g. `127.0.0.1:8080`) pins the llama.cpp host;
+without it, local/private hosts match per request.
 
 ## Notes / caveats
 
@@ -183,6 +204,12 @@ Everything is a module-level constant in `index.ts`:
   untouched.
 - Last Prompt stats are reported by the *server*; `cache`% is prompt-cache hit
   ratio, not KV-cache memory.
+- Live prefill %/t/s and the final `Last Prompt` rate use different
+  denominators (live includes cache lookup; final is llama.cpp's
+  `t_prompt_processing`), so live reads slightly lower than final.
+- The live Gen rate is an estimate (the only in-flight source); the
+  post-prompt Gen is the server's own measured rate when llama.cpp reports
+  `predicted_n` / `predicted_ms`.
 - The extension renders nothing until `session_start`; a placeholder
   ` ⚡ Gen -- t/s | Last Prompt -- t/s` appears on session start.
 
