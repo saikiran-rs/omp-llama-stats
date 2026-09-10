@@ -2,7 +2,9 @@
 
 One plain-ASCII status line for local-model speed stats in **oh-my-pi (omp)**
 (also works in **pi**): generation throughput and last-prompt processing speed
-from llama.cpp-family servers (LM Studio, llama.cpp server, ...).
+from **any OpenAI-compatible server** — llama.cpp / LM Studio, vLLM, SGLang,
+TGI, and hosted APIs. llama.cpp's exact server-side timings are used when the
+server reports them; everything else is measured from the stream itself.
 
 ```
 ...last assistant response line
@@ -11,8 +13,9 @@ from llama.cpp-family servers (LM Studio, llama.cpp server, ...).
 ~ (main*) ... lmstudio/big
 ```
 
-- **Gen** — generation tokens/sec, live (1s sliding window) and final
-  (llama.cpp's measured predicted rate; wall-clock average fallback).
+- **Gen** — generation tokens/sec, live (1s sliding window) and final. Final
+  prefers llama.cpp's measured predicted rate, then a stream-derived decode
+  rate that works on any engine (see *Engine-agnostic rates* below).
 - **Last Prompt** — prompt-processing tokens/sec from llama.cpp's SSE progress
   data, with new-token and cache-hit counts.
 - **Prefill progress** — while the server processes the prompt, the working
@@ -20,9 +23,9 @@ from llama.cpp-family servers (LM Studio, llama.cpp server, ...).
 - **Top padding** — a blank line between the transcript and the status row
   (omp-specific; see below).
 
-Gen works against any provider. Last Prompt appears only for endpoints that
-support llama.cpp's `return_progress` / `timings` fields (LM Studio and the
-llama.cpp server do; hosted APIs don't — it then shows `--`).
+Gen works against any provider. Last Prompt uses llama.cpp's `timings` when
+present, and otherwise falls back to `usage.prompt_tokens / TTFT` for any
+server that returns a usage block.
 
 ## Install
 
@@ -197,6 +200,48 @@ Everything is a module-level constant in `index.ts`:
 Env: `OMP_LLAMA_HOST` (e.g. `127.0.0.1:8080`) pins the llama.cpp host;
 without it, local/private hosts match per request.
 
+## Engine-agnostic rates (the vLLM fix)
+
+Reported bug: **vLLM showed roughly half (or less) of the real generation
+rate**, while llama.cpp read correctly. Measured against a live vLLM 0.28
+(Qwen3.8-27B, TP4) there were **two independent causes**, both from assuming
+llama.cpp's stream shape:
+
+| | real decode | old live (1 tok/delta) | old final (wall clock) |
+|---|---:|---:|---:|
+| short prompt | 59.4 | 28.3 | 57.8 |
+| 10K-token prompt | 50.0 | 20.2 | **5.6** |
+
+1. **Engines batch tokens into SSE chunks.** llama.cpp emits one token per
+   chunk, so "count 1 token per delta" was right there. vLLM packs **2.1-2.5
+   tokens per chunk** (measured), so the live rate read ~1/2 to ~1/3 of real.
+   Fixed by learning the ratio from the previous response's
+   `usage.completion_tokens / content_chunks` and scaling the live counter.
+2. **The non-llama fallback divided by wall clock, which includes prefill.**
+   At a 10K prompt, TTFT is ~33 s against ~4 s of decode, so the reported rate
+   collapsed to 5.6 t/s. Fixed by timing the **decode interval only** — first
+   content delta to last content delta — and dividing
+   `usage.completion_tokens - 1` by it. (`n-1`: the interval spans one fewer
+   inter-token gap than there are tokens.)
+
+Precedence for the settled Gen rate, best source first:
+
+1. `timings.predicted_n / predicted_ms` — llama.cpp's own sampling-loop
+   timing, exact and server-side;
+2. **stream-derived decode rate** — any OpenAI-compatible engine, excludes
+   prefill;
+3. wall-clock average — only when there is no usage block or no streaming.
+
+Verified end-to-end against the live server: ground truth 48.7 t/s, patched
+extension 48.7 t/s (0.0% error), old behaviour 24.1 t/s.
+
+⚠️ `Last Prompt` on a server without `timings` is `prompt_tokens / TTFT`, an
+**effective** rate: with prefix caching a cache hit makes TTFT tiny and the
+number very large (a cached 14K prompt reads ~3900 t/s). llama.cpp's number
+excludes cached tokens from the numerator; other engines mostly do not report
+`prompt_tokens_details.cached_tokens`, so the cache bracket is omitted and the
+rate includes the cache benefit. Treat it as time-to-first-token throughput.
+
 ## Notes / caveats
 
 - The fetch hook is process-wide: every session in the omp process routes
@@ -209,7 +254,10 @@ without it, local/private hosts match per request.
   `t_prompt_processing`), so live reads slightly lower than final.
 - The live Gen rate is an estimate (the only in-flight source); the
   post-prompt Gen is the server's own measured rate when llama.cpp reports
-  `predicted_n` / `predicted_ms`.
+  `predicted_n` / `predicted_ms`, else the stream-derived decode rate.
+- The live token-per-chunk scale is learned from the **previous** response, so
+  the very first response of a session estimates live Gen at 1 token/chunk on
+  a batching engine. The settled value is always correct.
 - The extension renders nothing until `session_start`; a placeholder
   ` ⚡ Gen -- t/s | Last Prompt -- t/s` appears on session start.
 

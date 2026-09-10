@@ -40,6 +40,23 @@ const server = Bun.serve({
   port: 0,
   fetch: async (req: Request) => {
     const url = new URL(req.url);
+    if (url.pathname === "/vllm/v1/chat/completions") {
+      // vLLM-shaped stream: NO `timings` block, tokens BATCHED into chunks
+      // (measured 2.1-2.5 tok/chunk on a live vLLM 0.28), usage at the end.
+      saw.push(JSON.parse(await req.text()));
+      const body = (async function* () {
+        // 200 ms of "prefill" before the first content delta
+        await Bun.sleep(200);
+        for (let i = 0; i < 4; i++) {
+          yield "data: " + JSON.stringify({ choices: [{ delta: { content: "abc " } }] }) + "\n\n";
+          await Bun.sleep(100);
+        }
+        // 12 completion tokens over 4 content chunks = 3 tok/chunk
+        yield "data: " + JSON.stringify({ usage: { prompt_tokens: 500, completion_tokens: 12 } }) + "\n\n";
+        yield "data: [DONE]\n\n";
+      })();
+      return new Response(body, { headers: { "content-type": "text/event-stream" } });
+    }
     if (url.pathname !== "/v1/chat/completions") return new Response("nope", { status: 404 });
     saw.push(JSON.parse(await req.text()));
     const chunks = [
@@ -110,6 +127,39 @@ handlers.agent_end({
 assert("e2e: final line uses server-exact gen (420 tok / 9 s = 46.7)",
   strip(statuses.tokenSpeed),
   " ⚡ Gen 46.7 t/s | Last Prompt 434 t/s [Cache 25.0% | 150 new / 50 cached]");
+
+// ── engine-agnostic path: a server with NO llama.cpp `timings` ───────
+// Regression for the reported bug: vLLM reported roughly half (or less) of
+// the real generation rate. Two causes, both covered here.
+handlers.before_agent_start({}, ctx);
+handlers.message_update({ assistantMessageEvent: { type: "text_start" } });
+
+const t0 = Date.now();
+const res2 = await fetch(`http://127.0.0.1:${server.port}/vllm/v1/chat/completions`, {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ model: "m", stream: true, messages: [{ role: "user", content: "hi" }] }),
+});
+await res2.text();
+const wallSec = (Date.now() - t0) / 1000;
+
+handlers.agent_end({
+  willContinue: false,
+  messages: [{ role: "user" }, { role: "assistant", content: [], usage: { output: 12 } }],
+});
+
+const vllmLine = strip(statuses.tokenSpeed);
+const genMatch = /Gen ([\d.]+) t\/s/.exec(vllmLine);
+const genRate = genMatch ? Number(genMatch[1]) : 0;
+// Decode interval is ~300 ms (3 gaps x 100 ms) for 12 tokens -> ~36 t/s.
+// The old wall-clock fallback divided by ~600 ms (incl. the 200 ms prefill),
+// which is the bug: it would read ~20 t/s or lower.
+assert("e2e/vllm: gen uses the decode interval, not wall clock",
+  genRate > 25 && genRate < 60, true);
+assert("e2e/vllm: gen beats the wall-clock average it used to report",
+  genRate > 12 / wallSec, true);
+assert("e2e/vllm: prompt rate derived from usage + TTFT (no timings)",
+  /Last Prompt [\d.]+ t\/s/.test(vllmLine), true);
 
 // ── fetch teardown: clobber protection, then clean restore ────────────
 const other = (input: RequestInfo | URL, init?: RequestInit) => ours(input, init);
