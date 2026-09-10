@@ -1,7 +1,7 @@
 {
   "name": "omp-llama-stats",
-  "version": "0.2.4",
-  "description": "Plain-ASCII Gen / Last Prompt (prompt-processing) speed status line for oh-my-pi (omp) and pi with local llama.cpp / LM Studio models",
+  "version": "0.3.0",
+  "description": "Plain-ASCII Gen / Last Prompt (prompt-processing) speed status line for oh-my-pi (omp) and pi — any OpenAI-compatible server (llama.cpp, LM Studio, vLLM, SGLang, ...)",
   "license": "MIT",
   "author": {
     "name": "saikiran-rs",
@@ -14,6 +14,7 @@
     "pi-coding-agent",
     "llama.cpp",
     "lmstudio",
+    "vllm",
     "extension",
     "status-line",
     "tokens-per-second",

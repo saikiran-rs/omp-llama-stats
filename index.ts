@@ -186,18 +186,31 @@ class TpsEngine {
     this._pausedMs += Date.now() - this._startPause;
   }
 
-  /** countStrategy: "direct" — 1 token per delta event. */
+  /**
+   * One delta event. NOT one token: engines batch a variable number of tokens
+   * into each SSE chunk (llama.cpp sends 1, vLLM measured at 2.1-2.5), so a
+   * "1 token per delta" count reads low by exactly that factor on any engine
+   * that batches. `tokenScale` is the ratio learned from the previous
+   * completed response on this endpoint; it defaults to 1, which is the old
+   * behaviour and is correct for llama.cpp.
+   */
   recordDelta(): void {
     if (!this._isStreaming) return;
     if (this._isPaused) this.resume();
-    this.recordTokens(1);
+    this.recordTokens(this._tokenScale);
   }
+
+  /** Tokens per streamed delta, learned from a completed response. */
+  setTokenScale(scale: number): void {
+    if (Number.isFinite(scale) && scale > 0) this._tokenScale = scale;
+  }
+  private _tokenScale = 1;
 
   reconcileTotal(tokens: number): void {
     if (tokens > 0) this._tokenCount = tokens;
   }
   private recordTokens(tokens: number): void {
-    if (!this._isStreaming || tokens <= 0) return;
+    if (!this._isStreaming || !(tokens > 0)) return;
     this._tokenCount += tokens;
     this._slidingWindow.record(tokens);
   }
@@ -231,6 +244,16 @@ let ppStats: PpStats | null = null;
 // `predicted_ms`, accumulated across the requests of one user prompt
 // (reset in before_agent_start).
 let tgAccum = { n: 0, ms: 0 };
+// Engine-agnostic generation timing, derived from the SSE stream itself for
+// servers that report no `timings` block (vLLM, SGLang, TGI, hosted APIs...).
+// tokens come from `usage.completion_tokens`; the interval is first-content
+// delta -> last-content delta, so PREFILL/TTFT is excluded. Without this the
+// only fallback was tokens/wall-clock, which at a 10K prompt measured 5.6 t/s
+// against a real 50.0 because TTFT dominated the denominator.
+let genericTg = { tokens: 0, ms: 0 };
+// Tokens per streamed content chunk, learned from the last completed response
+// and fed to the live estimate. 1 = llama.cpp; vLLM measured 2.1-2.5.
+let lastTokensPerChunk = 1;
 // Warn once per process when a llama.cpp build predates `timings.cache_n`.
 let warnedMissingCacheN = false;
 
@@ -321,8 +344,18 @@ function renderStatus(force = false): void {
   // After the prompt ends, prefer the server-measured rate (ground truth)
   // over the wall-clock reconstruction; while streaming, the live estimate
   // is the only in-flight source.
-  const tps =
-    !engine.isStreaming && tgAccum.ms > 0 ? (1000 * tgAccum.n) / tgAccum.ms : engine.tps;
+  // Precedence for the settled rate, best source first:
+  //   1. llama.cpp's own sampling-loop timing (exact, server-side)
+  //   2. stream-derived decode interval + usage tokens (any OpenAI-compatible
+  //      engine; excludes prefill, so it is not the old wall-clock average)
+  //   3. the live/wall-clock estimate (no usage, or a non-streaming response)
+  const settled =
+    tgAccum.ms > 0
+      ? (1000 * tgAccum.n) / tgAccum.ms
+      : genericTg.ms > 0
+        ? (1000 * genericTg.tokens) / genericTg.ms
+        : null;
+  const tps = !engine.isStreaming && settled !== null ? settled : engine.tps;
   const gen = engine.everStreamed ? colorHex(formatRate(tps), tpsColor(tps)) : "-- t/s";
   const prompt = ppStats ? formatPrompt(ppStats) : "-- t/s";
   uiRef.setStatus(STATUS_KEY, ` ⚡ Gen ${gen} | Last Prompt ${prompt}`);
@@ -376,18 +409,87 @@ function enableProgress(init?: RequestInit): void {
   } catch {}
 }
 
-function capture(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+function capture(
+  body: ReadableStream<Uint8Array>,
+  requestStart: number,
+): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
 
+  // Engine-agnostic per-response accounting. Every OpenAI-compatible server
+  // gives us content deltas and (with stream_options.include_usage) a final
+  // usage block, so these work without any server-specific fields.
+  let firstContentAt = 0;
+  let lastContentAt = 0;
+  let contentChunks = 0;
+  let sawLlamaTimings = false;
+  let usage: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    prompt_tokens_details?: { cached_tokens?: number } | null;
+  } | null = null;
+
+  // Called once when the stream ends. Only fills in what the server did not
+  // already report exactly, so llama.cpp behaviour is untouched.
+  const finalize = () => {
+    const completion = usage?.completion_tokens ?? 0;
+    const spanMs = lastContentAt - firstContentAt;
+
+    if (!sawLlamaTimings && completion > 1 && spanMs > 0) {
+      // n-1: the interval is measured BETWEEN the first and last token, so it
+      // spans one fewer inter-token gap than there are tokens.
+      genericTg.tokens += completion - 1;
+      genericTg.ms += spanMs;
+    }
+
+    if (contentChunks > 0 && completion > 0) {
+      lastTokensPerChunk = completion / contentChunks;
+      engine.setTokenScale(lastTokensPerChunk);
+    }
+
+    // Prompt rate for servers with no `timings`: prompt tokens over TTFT.
+    // This is an EFFECTIVE rate (a prefix-cache hit makes TTFT small and the
+    // number large); llama.cpp's exact prompt_per_second always wins when present.
+    if (!sawLlamaTimings && usage?.prompt_tokens && firstContentAt > requestStart) {
+      const ttftSec = (firstContentAt - requestStart) / 1000;
+      const cached = usage.prompt_tokens_details?.cached_tokens ?? 0;
+      if (ttftSec > 0) {
+        ppStats = {
+          pp: usage.prompt_tokens / ttftSec,
+          newTokens: Math.max(0, usage.prompt_tokens - cached),
+          cached,
+        };
+      }
+    }
+    renderStatus(true);
+  };
+
   const handleLine = (line: string) => {
     if (!line.startsWith("data: ")) return;
     const raw = line.slice(6).trim();
-    if (!raw || raw === "[DONE]") return;
+    if (!raw) return;
+    if (raw === "[DONE]") {
+      finalize();
+      return;
+    }
 
     try {
       const chunk = JSON.parse(raw);
+
+      // Generic: content/reasoning deltas mark the decode interval.
+      const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+      for (const c of choices) {
+        const d = c?.delta;
+        if (!d) continue;
+        if (d.content || d.reasoning_content || d.reasoning) {
+          const now = Date.now();
+          if (firstContentAt === 0) firstContentAt = now;
+          lastContentAt = now;
+          contentChunks++;
+        }
+      }
+      if (chunk.usage) usage = chunk.usage;
 
       // Live prefill display
       if (chunk.prompt_progress && uiRef && hasUI) {
@@ -411,6 +513,7 @@ function capture(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
 
       // Final llama.cpp statistics
       if (chunk.timings && typeof chunk.timings.prompt_per_second === "number") {
+        sawLlamaTimings = true;
         const t = chunk.timings;
         ppStats = {
           pp: t.prompt_per_second,
@@ -438,6 +541,8 @@ function capture(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
     async pull(controller) {
       const { done, value } = await reader.read();
       if (done) {
+        // Some servers close without a [DONE] sentinel.
+        finalize();
         controller.close();
         return;
       }
@@ -475,10 +580,11 @@ export default function (pi: ExtensionAPI) {
 
     enableProgress(init);
 
+    const requestStart = Date.now();
     const response = await originalFetch!(input, init);
 
     if (response.ok && response.body) {
-      return new Response(capture(response.body), {
+      return new Response(capture(response.body, requestStart), {
         status: response.status,
         statusText: response.statusText,
         headers: new Headers(response.headers),
@@ -503,6 +609,7 @@ export default function (pi: ExtensionAPI) {
     hasUI = ctx.hasUI;
     // New user prompt: the exact-generation accumulator starts fresh.
     tgAccum = { n: 0, ms: 0 };
+    genericTg = { tokens: 0, ms: 0 };
     if (hasUI) {
       ctx.ui.setStatus(PAD_KEY, " ");
     }
