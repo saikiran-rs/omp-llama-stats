@@ -1,7 +1,7 @@
 {
   "name": "omp-llama-stats",
-  "version": "0.3.0",
-  "description": "Plain-ASCII Gen / Last Prompt (prompt-processing) speed status line for oh-my-pi (omp) and pi — any OpenAI-compatible server (llama.cpp, LM Studio, vLLM, SGLang, ...)",
+  "version": "0.4.0",
+  "description": "Fixed-width Gen / Last Prompt (prompt-processing) speed status line for oh-my-pi (omp) and pi — any OpenAI-compatible server (llama.cpp, LM Studio, vLLM, SGLang, ...)",
   "license": "MIT",
   "author": {
     "name": "saikiran-rs",
