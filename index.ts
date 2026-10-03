@@ -1,279 +1,39 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-// Unified speed stats for omp: one status line:
-//
-//   ⚡ Gen <rate> t/s | Last Prompt <rate> t/s [Cache <pct>% | <n> new / <c> cached]
-//
-//  - Gen: generation tokens/sec. Live: 1s sliding-window estimate (ported
-//    from pi-token-speed@0.7.1). Final: llama.cpp's own decode timing
-//    (`timings.predicted_n - 1` / `predicted_ms`) summed per prompt, else the
-//    stream-derived decode interval, else a wall-clock average
-//  - Last Prompt: prompt-processing tokens/sec from llama.cpp SSE
-//    progress/timings — per-request, never a rolling average
-//
-// Every value sits in a fixed-width slot so the line never changes length.
-//
-// omp renders one footer line per setStatus key, so both metrics must share
-// a single key to appear on one line.
-
-// ═══════════════════════════════════════════════════════════════
-// Event payload shapes (subset used, mirrors pi-token-speed EventManager)
-// ═══════════════════════════════════════════════════════════════
-
-interface ToolCallContent {
-  type?: string;
-  name?: string;
-}
-
-interface AssistantMessageEventPayload {
-  type: string;
-  delta?: string;
-  partial?: {
-    content?: ToolCallContent[];
-    usage?: { output?: number };
-  };
-  contentIndex?: number;
-}
-
-interface MessageUpdateEvent {
-  assistantMessageEvent?: AssistantMessageEventPayload;
-}
-
-interface AgentEndMessage {
-  role: string;
-  content?: ToolCallContent[];
-  usage?: { output?: number };
-}
-
-interface AgentEndEvent {
-  messages?: AgentEndMessage[];
-  willContinue?: boolean;
-}
-
-/** The slice of the extension UI this extension drives. */
+// Only server measurements are displayed. Stream chunks, UI delta events,
+// network arrival times, and previous responses cannot establish token speed.
 interface UiRef {
-  theme?: { fg?: (kind: string, text: string) => string };
   setStatus: (key: string, text?: string) => void;
   setWorkingMessage: (text?: string) => void;
 }
-
-// ═══════════════════════════════════════════════════════════════
-// TPS engine (port of pi-token-speed; divergences noted in the README)
-// ═══════════════════════════════════════════════════════════════
-
-const SLIDING_WINDOW_MS = 1000;
-const MIN_SLIDING_WINDOW_MS = 100;
-const COMPACTION_THRESHOLD = 5000;
-
-class SlidingWindow {
-  private readonly events: { time: number; tokens: number }[] = [];
-  private windowStartIndex = 0;
-  // Deltas recorded since the last reset (compaction does not lower it).
-  private recorded = 0;
-
-  constructor(private readonly windowMs: number) {}
-
-  record(tokens: number): void {
-    this.events.push({ time: Date.now(), tokens });
-    this.recorded++;
-    if (this.windowStartIndex >= COMPACTION_THRESHOLD) this.compact();
-  }
-
-  /** Live rate, or null until two deltas exist to span an interval. */
-  getTps(now: number): number | null {
-    if (this.recorded < 2) return null;
-
-    // N tokens span N-1 complete generation intervals; the oldest in-window
-    // token anchors the span, so count only tokens after it.
-    const windowStart = now - this.windowMs;
-    while (
-      this.windowStartIndex < this.events.length &&
-      this.events[this.windowStartIndex].time < windowStart
-    ) {
-      this.windowStartIndex++;
-    }
-    // A stalled stream decays to 0 instead of pinning the last value.
-    if (this.events.length - this.windowStartIndex < 2) return 0;
-
-    let windowTokenCount = 0;
-    for (let i = this.windowStartIndex + 1; i < this.events.length; i++) {
-      windowTokenCount += this.events[i].tokens;
-    }
-    if (windowTokenCount === 0) return 0;
-
-    const span = Math.max(now - this.events[this.windowStartIndex].time, MIN_SLIDING_WINDOW_MS);
-    return (1000 * windowTokenCount) / span;
-  }
-
-  private compact(): void {
-    if (this.windowStartIndex === 0) return;
-    this.events.splice(0, this.windowStartIndex);
-    this.windowStartIndex = 0;
-  }
-
-  reset(): void {
-    this.events.length = 0;
-    this.windowStartIndex = 0;
-    this.recorded = 0;
-  }
-}
-
-class TpsEngine {
-  private _isStreaming = false;
-  private _isPaused = false;
-  private _tokenCount = 0;
-  private _firstDeltaAt = 0;
-  private _firstDeltaTokens = 0;
-  private _lastDeltaAt = 0;
-  private _startPause = 0;
-  private _pausedMs = 0;
-  private _tokenScale = 1;
-  private readonly _slidingWindow = new SlidingWindow(SLIDING_WINDOW_MS);
-
-  get isStreaming(): boolean {
-    return this._isStreaming;
-  }
-
-  /** Tokens are flowing: streaming and not paused for a tool. */
-  get isLive(): boolean {
-    return this._isStreaming && !this._isPaused;
-  }
-
-  /**
-   * Sliding-window rate while tokens are flowing. Null when not live (tool
-   * execution / next prefill is not generation) or before two deltas exist —
-   * never a fake 0 at the start of a stream. Computed at read time, so a
-   * stalled stream decays toward 0 instead of pinning.
-   */
-  get liveTps(): number | null {
-    if (!this.isLive) return null;
-    return this._slidingWindow.getTps(Date.now());
-  }
-
-  /**
-   * Average decode rate over the streamed deltas: the tokens after the first
-   * delta over first-delta -> last-delta time, minus the pauses between them
-   * (the same n-1 interval rule as the server-side paths). Null until the
-   * interval spans MIN_SLIDING_WINDOW_MS, so a few deltas can't spike it.
-   */
-  get tpsAvg(): number | null {
-    const ms = this._lastDeltaAt - this._firstDeltaAt - this._pausedMs;
-    const tokens = this._tokenCount - this._firstDeltaTokens;
-    return this._firstDeltaAt > 0 && ms >= MIN_SLIDING_WINDOW_MS && tokens > 0
-      ? (1000 * tokens) / ms
-      : null;
-  }
-
-  start(): void {
-    if (this._isStreaming) return;
-    this._isStreaming = true;
-    this._tokenCount = 0;
-    this._firstDeltaAt = 0;
-    this._firstDeltaTokens = 0;
-    this._lastDeltaAt = 0;
-    this._slidingWindow.reset();
-    this._pausedMs = 0;
-    // A pause left open by the previous prompt must not leak into this one.
-    this._isPaused = false;
-    this._startPause = 0;
-  }
-
-  stop(): void {
-    // An open pause began after the last delta: outside the measured
-    // interval, so it is dropped, not subtracted.
-    this._isPaused = false;
-    this._isStreaming = false;
-    this._slidingWindow.reset();
-  }
-
-  pause(): void {
-    // Ignore re-pause (parallel tool calls) and pauses outside streaming.
-    if (!this._isStreaming || this._isPaused) return;
-    this._isPaused = true;
-    this._startPause = Date.now();
-  }
-
-  /**
-   * One delta event. NOT one token: engines batch a variable number of tokens
-   * into each SSE chunk (llama.cpp sends 1, vLLM measured at 2.1-2.5), so a
-   * "1 token per delta" count reads low by exactly that factor on any engine
-   * that batches. `tokenScale` is the ratio learned from the previous
-   * completed response on this endpoint; it defaults to 1, which is the old
-   * behaviour and is correct for llama.cpp.
-   */
-  recordDelta(): void {
-    if (!this._isStreaming) return;
-    const now = Date.now();
-    if (this._isPaused) {
-      this._isPaused = false;
-      // A pause ended by a delta lies between two deltas: exclude it.
-      if (this._firstDeltaAt > 0) this._pausedMs += now - this._startPause;
-      // The window must not span the pause either, or the first live reading
-      // after it would divide fresh tokens by the dead time.
-      this._slidingWindow.reset();
-    }
-    const tokens = this._tokenScale;
-    if (this._firstDeltaAt === 0) {
-      this._firstDeltaAt = now;
-      this._firstDeltaTokens = tokens;
-    }
-    this._lastDeltaAt = now;
-    this._tokenCount += tokens;
-    this._slidingWindow.record(tokens);
-  }
-
-  /** Tokens per streamed delta, learned from a completed response. */
-  setTokenScale(scale: number): void {
-    if (Number.isFinite(scale) && scale > 0) this._tokenScale = scale;
-  }
-
-  reconcileTotal(tokens: number): void {
-    if (tokens > 0) this._tokenCount = tokens;
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Shared state
-// ═══════════════════════════════════════════════════════════════
-
-let originalFetch: typeof fetch | null = null;
-let uiRef: UiRef | null = null;
-let hasUI = false;
-// Explicit pin for the llama.cpp host (e.g. "127.0.0.1:8080") when proxying;
-// without it, only local/private hosts are treated as llama.cpp.
-const LLAMA_HOST: string | null =
-  String((globalThis as Record<string, any>).process?.env?.OMP_LLAMA_HOST ?? "")
-    .trim()
-    .toLowerCase() || null;
-
-const engine = new TpsEngine();
-
 interface PpStats {
-  /** prompt tokens/sec, per-request; null when nothing was processed */
   pp: number | null;
-  /** uncached prompt tokens (`timings.prompt_n`); null when unknown */
   newTokens: number | null;
-  /** cached prompt tokens (`timings.cache_n`); null when the server does not say */
   cached: number | null;
 }
+interface RequestStats {
+  epoch: number;
+  gen: { rate: number; ms: number | null } | null;
+  prompt: PpStats | null;
+  finished: boolean;
+  failed: boolean;
+}
 
+const LLAMA_HOST: string | null =
+  String((globalThis as Record<string, any>).process?.env?.OMP_LLAMA_HOST ?? "")
+    .trim().toLowerCase() || null;
+let uiRef: UiRef | null = null;
+let hasUI = false;
 let ppStats: PpStats | null = null;
-// Exact generation timing from llama.cpp `timings.predicted_n` /
-// `predicted_ms`, accumulated across the requests of one user prompt
-// (reset in before_agent_start): decode steps and microseconds.
-let tgAccum = { n: 0, us: 0 };
-// Engine-agnostic generation timing, derived from the SSE stream itself for
-// servers that report no `timings` block (vLLM, SGLang, TGI, hosted APIs...).
-// tokens come from `usage.completion_tokens`; the interval is first-content
-// delta -> last-content delta, so PREFILL/TTFT is excluded. Without this the
-// only fallback was tokens/wall-clock, which at a 10K prompt measured 5.6 t/s
-// against a real 50.0 because TTFT dominated the denominator.
-let genericTg = { tokens: 0, us: 0 };
-// Tokens per streamed delta event, learned per host from its last completed
-// response and fed to the live estimate. 1 = llama.cpp; vLLM measured 2.1-2.5.
-const tokensPerDelta = new Map<string, number>();
-// Warn once per process when a llama.cpp build predates `timings.cache_n`.
-let warnedMissingCacheN = false;
+let epoch = 0;
+let promptActive = false;
+let activeModel: { id?: string; baseUrl?: string } | undefined;
+let requests: RequestStats[] = [];
+// Modern Pi exposes session-scoped provider hooks. Match its payload to the
+// fetch request, so title generation and other sessions cannot enter our stats.
+let nativeHooks = false;
+let nativeRequest: RequestStats | null = null;
+let nativePayload: { model?: unknown; messages?: unknown } | null = null;
 
 // Same key pi-token-speed used — pi-token-speed must stay disabled while this
 // extension is active, or both would fight over the same status entry.
@@ -406,21 +166,32 @@ function formatPrompt(s: PpStats | null): string {
   );
 }
 
-/** Settled Gen for the current prompt from server-side or stream timing. */
-function settledTps(): number | null {
-  if (tgAccum.n > 0 && tgAccum.us > 0) return rateTenths(tgAccum.n, tgAccum.us);
-  if (genericTg.tokens > 0 && genericTg.us > 0) return rateTenths(genericTg.tokens, genericTg.us);
-  return null;
+function tokenCount(v: unknown): number | null {
+  return isNum(v) && Number.isSafeInteger(v) && v >= 0 ? v : null;
+}
+function positive(v: unknown): number | null {
+  return isNum(v) && v > 0 ? v : null;
+}
+
+/** Server rates weighted by server decode duration, with no missing requests. */
+function generationRate(): number | null {
+  if (!requests.length || requests.some((r) => r.failed || r.gen === null)) return null;
+  if (requests.length === 1) return requests[0].gen!.rate;
+  let work = 0;
+  let ms = 0;
+  for (const r of requests) {
+    if (r.gen!.ms === null) return null; // an unweighted average would be wrong
+    work += r.gen!.rate * r.gen!.ms!;
+    ms += r.gen!.ms!;
+  }
+  return ms > 0 ? work / ms : null;
 }
 
 const RENDER_INTERVAL_MS = 100;
 let lastRender = 0;
 let renderTimer: ReturnType<typeof setTimeout> | null = null;
-
 function renderStatus(force = false): void {
   if (!uiRef || !hasUI) return;
-
-  // Throttle per-token repaints; a trailing flush keeps the final value fresh.
   const now = Date.now();
   if (!force && now - lastRender < RENDER_INTERVAL_MS) {
     renderTimer ??= setTimeout(() => {
@@ -429,34 +200,37 @@ function renderStatus(force = false): void {
     }, RENDER_INTERVAL_MS - (now - lastRender));
     return;
   }
-
-  if (renderTimer) {
-    clearTimeout(renderTimer);
-    renderTimer = null;
-  }
+  if (renderTimer) clearTimeout(renderTimer);
+  renderTimer = null;
   lastRender = now;
-
-  // While tokens flow, the live estimate is the only in-flight source (the
-  // prompt's settled rate so far stands in until it has two deltas).
-  // Otherwise (paused between requests, or the prompt is over) the settled
-  // rate, best source first:
-  //   1. llama.cpp's own decode timing (exact, server-side)
-  //   2. stream-derived decode interval + usage tokens (any OpenAI-compatible
-  //      engine; excludes prefill, so it is not the old wall-clock average)
-  //   3. the engine's delta-interval average, reconciled to usage at prompt
-  //      end (a provider the fetch hook does not see)
-  const tps = engine.isLive
-    ? engine.liveTps ?? settledTps()
-    : settledTps() ?? engine.tpsAvg;
-  uiRef.setStatus(STATUS_KEY, ` ⚡ Gen ${formatGen(tps)} t/s | Last Prompt ${formatPrompt(ppStats)}`);
+  try {
+    uiRef.setStatus(STATUS_KEY,
+      ` ⚡ Gen ${formatGen(generationRate())} t/s | Last Prompt ${formatPrompt(ppStats)}`);
+  } catch {}
+}
+function current(r: RequestStats): boolean {
+  return r.epoch === epoch && requests.includes(r);
+}
+function newRequest(): RequestStats {
+  const r: RequestStats = { epoch, gen: null, prompt: null, finished: false, failed: false };
+  requests.push(r);
+  renderStatus(true);
+  return r;
+}
+function clearWorking(): void {
+  try { if (hasUI) uiRef?.setWorkingMessage(); } catch {}
+}
+function reset(): void {
+  epoch++;
+  requests = [];
+  nativeRequest = null;
+  nativePayload = null;
+  ppStats = null;
+  if (renderTimer) clearTimeout(renderTimer);
+  renderTimer = null;
+  clearWorking();
 }
 
-// ═══════════════════════════════════════════════════════════════
-// llama.cpp SSE hook
-// ═══════════════════════════════════════════════════════════════
-
-// Local/private match per request so a cloud provider (or a proxy fronting
-// one) never gets `return_progress` injected — OpenAI 400s on it.
 function isLocalHost(hostname: string): boolean {
   const name = hostname.replace(/^\[|\]$/g, "").toLowerCase();
   return (
@@ -491,384 +265,256 @@ function llamaHost(input: RequestInfo | URL): string | null {
   }
 }
 
-function enableProgress(init?: RequestInit): void {
+/** Copy the body and options: never mutate a caller's RequestInit. */
+function enableProgress(payload: Record<string, any>): Record<string, any> {
+  return {
+    ...payload,
+    return_progress: true,
+    timings_per_token: true,
+    stream_options: { ...payload.stream_options, include_usage: true },
+  };
+}
+function parsePayload(body: unknown): Record<string, any> | null {
+  if (typeof body !== "string") return null;
   try {
-    if (!init?.body || typeof init.body !== "string") return;
+    const value = JSON.parse(body);
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch { return null; }
+}
 
-    const body = JSON.parse(init.body);
-
-    if (body.stream) {
-      body.return_progress = true;
-      body.stream_options ??= {};
-      body.stream_options.include_usage = true;
+/** Timings are cumulative per request. Replace snapshots; never add them. */
+function observe(r: RequestStats, chunk: any): void {
+  if (!current(r) || r.finished || !chunk || typeof chunk !== "object") return;
+  const t = chunk.timings;
+  if (t && typeof t === "object") {
+    if ("predicted_per_second" in t || "predicted_n" in t || "predicted_ms" in t) {
+      // The server owns the n versus n-1 convention (it varies by build).
+      // Copy its rate rather than trying to reconstruct that convention.
+      const rate = positive(t.predicted_per_second);
+      const count = tokenCount(t.predicted_n);
+      r.gen = rate !== null && count !== 0
+        ? { rate, ms: positive(t.predicted_ms) } : null;
     }
-
-    init.body = JSON.stringify(body);
-  } catch {}
-}
-
-function nonEmpty(v: unknown): boolean {
-  return typeof v === "string" ? v.length > 0 : Array.isArray(v) && v.length > 0;
-}
-
-interface LlamaTimings {
-  prompt_n?: number;
-  prompt_ms?: number;
-  prompt_per_second?: number;
-  cache_n?: number;
-  predicted_n?: number;
-  predicted_ms?: number;
-}
-
-/** Last Prompt stats from a llama.cpp `timings` block, or null if it has none. */
-function llamaPrompt(t: LlamaTimings): PpStats | null {
-  if (!isNum(t.prompt_n)) return null;
-  if (!isNum(t.cache_n) && !warnedMissingCacheN) {
-    warnedMissingCacheN = true;
-    console.warn(
-      "[omp-llama-stats] llama.cpp timings.cache_n missing (older build?) — cache stats will read as unknown",
-    );
+    if ("prompt_n" in t || "prompt_per_second" in t || "prompt_ms" in t || "cache_n" in t) {
+      const n = tokenCount(t.prompt_n);
+      const cache = tokenCount(t.cache_n);
+      const ms = positive(t.prompt_ms);
+      const rate = positive(t.prompt_per_second);
+      r.prompt = {
+        pp: n === 0 ? null : rate ?? (n !== null && ms !== null ? rateTenths(n, ms * 1000) : null),
+        newTokens: n,
+        cached: cache,
+      };
+    }
   }
-  let pp: number | null = null;
-  if (t.prompt_n > 0) {
-    // prompt_n / prompt_ms is exactly llama.cpp's prompt_per_second, but from
-    // integers (prompt_ms is whole microseconds / 1000), so rounding is exact.
-    if (isNum(t.prompt_ms) && t.prompt_ms > 0) pp = rateTenths(t.prompt_n, Math.round(t.prompt_ms * 1000));
-    else if (isNum(t.prompt_per_second)) pp = t.prompt_per_second;
+  // Usage can establish counts, but it cannot establish decode or prefill time.
+  const u = chunk.usage;
+  if (u && typeof u === "object") {
+    const total = tokenCount(u.prompt_tokens);
+    const cache = tokenCount(u.prompt_tokens_details?.cached_tokens);
+    if (total !== null && cache !== null && cache <= total) {
+      r.prompt ??= { pp: null, newTokens: total - cache, cached: cache };
+    }
   }
-  return { pp, newTokens: t.prompt_n, cached: isNum(t.cache_n) ? t.cache_n : null };
+  if (chunk.prompt_progress && hasUI && uiRef) {
+    const p = chunk.prompt_progress;
+    const processed = tokenCount(p.processed);
+    const cached = tokenCount(p.cache);
+    const total = tokenCount(p.total);
+    const ms = positive(p.time_ms);
+    if (processed !== null && cached !== null && total !== null &&
+        cached <= processed && processed <= total) {
+      if (processed < total) {
+        const n = processed - cached;
+        const pct = Math.floor(100 * n / (total - cached));
+        const rate = n > 0 && ms !== null ? formatRate(rateTenths(n, ms * 1000), PROMPT_WIDTH)
+          : pad(PLACEHOLDER, PROMPT_WIDTH);
+        uiRef.setWorkingMessage(`Prefilling... ${pad(String(pct), 2)}% · ${rate} t/s`);
+      } else uiRef.setWorkingMessage();
+    }
+  }
+  // Last Prompt always belongs to the newest request, even if it reports no
+  // prompt data. This prevents a previous server's numbers surviving a switch.
+  if (requests.at(-1) === r) ppStats = r.prompt;
+  renderStatus();
+}
+function finish(r: RequestStats, failed = false): void {
+  if (!current(r) || r.finished) return;
+  r.finished = true;
+  r.failed = failed;
+  if (failed) { r.gen = null; r.prompt = null; }
+  if (requests.at(-1) === r) {
+    ppStats = r.prompt;
+    clearWorking();
+  }
+  renderStatus(true);
 }
 
-function capture(
-  body: ReadableStream<Uint8Array>,
-  requestStart: number,
-  host: string,
-): ReadableStream<Uint8Array> {
+/** Parse SSE independently, forwarding the original bytes and cancellation. */
+function capture(body: ReadableStream<Uint8Array>, r: RequestStats): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-
-  // Engine-agnostic per-response accounting. Every OpenAI-compatible server
-  // gives us content deltas and (with stream_options.include_usage) a final
-  // usage block, so these work without any server-specific fields.
-  let firstContentAt = 0;
-  let lastContentAt = 0;
-  let deltaEvents = 0;
-  let timings: LlamaTimings | null = null;
-  let usage: {
-    prompt_tokens?: number;
-    completion_tokens?: number;
-    prompt_tokens_details?: { cached_tokens?: number } | null;
-  } | null = null;
-  let finalized = false;
-
-  // Called once when the stream ends ([DONE], or close without one). The
-  // last `timings` block wins, so a server that repeats it (e.g. with
-  // timings_per_token) is still counted exactly once.
-  const finalize = () => {
-    if (finalized) return;
-    finalized = true;
-    const u = usage;
-    const completion = u && isNum(u.completion_tokens) ? u.completion_tokens : 0;
-
-    // Gen. llama.cpp: the first token is free — it comes from the last prompt
-    // batch's logits — so predicted_ms spans predicted_n - 1 decode steps
-    // (llama.cpp's own predicted_per_second divides the same way).
-    if (timings && isNum(timings.predicted_n) && isNum(timings.predicted_ms)) {
-      if (timings.predicted_n > 1 && timings.predicted_ms > 0) {
-        tgAccum.n += timings.predicted_n - 1;
-        tgAccum.us += Math.round(timings.predicted_ms * 1000);
-      }
-    } else if (completion > 1 && lastContentAt > firstContentAt) {
-      // Same n-1 rule: the interval runs from the first content delta to the
-      // last, one fewer gap than there are tokens.
-      genericTg.tokens += completion - 1;
-      genericTg.us += (lastContentAt - firstContentAt) * 1000;
-    }
-
-    if (deltaEvents > 0 && completion > 0) {
-      tokensPerDelta.set(host, completion / deltaEvents);
-    }
-
-    // Last Prompt. llama.cpp's exact numbers win; otherwise tokens processed
-    // over TTFT. Only uncached tokens count when the server reports the cache
-    // split; without it the whole prompt counts, an EFFECTIVE rate that an
-    // unreported prefix-cache hit inflates.
-    const llama = timings ? llamaPrompt(timings) : null;
-    if (llama) {
-      ppStats = llama;
-    } else if (u && isNum(u.prompt_tokens) && u.prompt_tokens > 0 && firstContentAt > requestStart) {
-      const reported = u.prompt_tokens_details?.cached_tokens;
-      const cached = isNum(reported) ? reported : null;
-      const newTokens = cached === null ? null : Math.max(0, u.prompt_tokens - cached);
-      const processed = newTokens ?? u.prompt_tokens;
-      ppStats = {
-        pp: processed > 0 ? rateTenths(processed, (firstContentAt - requestStart) * 1000) : null,
-        newTokens,
-        cached,
-      };
-    }
-    renderStatus(true);
-  };
-
-  const handleLine = (line: string) => {
-    // SSE field "data:" with an optional space; trim() also drops a CR.
-    if (!line.startsWith("data:")) return;
-    const raw = line.slice(5).trim();
+  let data: string[] = [];
+  const dispatch = () => {
+    const raw = data.join("\n").trim();
+    data = [];
     if (!raw) return;
-    if (raw === "[DONE]") {
-      finalize();
-      return;
+    if (raw === "[DONE]") { finish(r); return; }
+    try { observe(r, JSON.parse(raw)); } catch {} // telemetry never breaks generation
+  };
+  const line = (value: string) => {
+    if (!value) { dispatch(); return; }
+    if (value.startsWith("data:")) data.push(value.slice(5).replace(/^ /, ""));
+  };
+  const feed = (value: string, eof = false) => {
+    buffer += value;
+    let end: number;
+    while ((end = buffer.indexOf("\n")) >= 0) {
+      line(buffer.slice(0, end).replace(/\r$/, ""));
+      buffer = buffer.slice(end + 1);
     }
-
-    try {
-      const chunk = JSON.parse(raw);
-
-      // Generated content marks the decode interval: text, reasoning and
-      // tool-call arguments alike (usage.completion_tokens counts all three).
-      // Counted the way the host turns a chunk into delta events — one per
-      // text, one per reasoning, one per tool-call entry — so the learned
-      // tokens-per-delta matches what recordDelta() sees.
-      const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
-      for (const c of choices) {
-        const d = c?.delta;
-        if (!d || typeof d !== "object") continue;
-        let events = 0;
-        if (nonEmpty(d.content)) events++;
-        if (nonEmpty(d.reasoning_content) || nonEmpty(d.reasoning) || nonEmpty(d.reasoning_text)) events++;
-        if (Array.isArray(d.tool_calls)) events += d.tool_calls.length;
-        if (events > 0) {
-          const now = Date.now();
-          if (firstContentAt === 0) firstContentAt = now;
-          lastContentAt = now;
-          deltaEvents += events;
-        }
-      }
-      if (chunk.usage && typeof chunk.usage === "object") usage = chunk.usage;
-      if (chunk.timings && typeof chunk.timings === "object") timings = chunk.timings;
-
-      // Live prefill display
-      if (chunk.prompt_progress && uiRef && hasUI) {
-        const p = chunk.prompt_progress;
-        const processed = isNum(p.processed) ? p.processed : 0;
-        const cached = isNum(p.cache) ? p.cache : 0;
-        const total = isNum(p.total) ? p.total : 0;
-        const ms = isNum(p.time_ms) ? p.time_ms : 0;
-
-        const newTokens = Math.max(0, processed - cached);
-        const totalNew = Math.max(0, total - cached);
-
-        if (processed < total) {
-          // Floor, so 100% only ever means done.
-          const pct = totalNew > 0 ? Math.floor((100 * newTokens) / totalNew) : 0;
-          const rate =
-            newTokens > 0 && ms > 0
-              ? formatRate(rateTenths(newTokens, Math.round(ms * 1000)), PROMPT_WIDTH)
-              : pad(PLACEHOLDER, PROMPT_WIDTH);
-          uiRef.setWorkingMessage(`Prefilling... ${pad(String(pct), 2)}% · ${rate} t/s`);
-        } else {
-          uiRef.setWorkingMessage();
-        }
-      }
-    } catch {}
+    if (eof) {
+      if (buffer) line(buffer.replace(/\r$/, ""));
+      buffer = "";
+      dispatch();
+    }
   };
-
-  // Stats must never break the stream the agent is reading.
-  const observe = (fn: () => void) => {
-    try {
-      fn();
-    } catch {}
-  };
-
-  // Pull-based: the consumer drives the pace (backpressure), and cancel
-  // propagates so a torn-down stream can't reject an already-settled one.
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
-      const { done, value } = await reader.read();
-      if (done) {
-        observe(() => {
-          // A last line without a trailing newline is still a line.
-          buffer += decoder.decode();
-          if (buffer) handleLine(buffer);
-          buffer = "";
-          // Some servers close without a [DONE] sentinel.
-          finalize();
-        });
-        controller.close();
-        return;
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          try { feed(decoder.decode(), true); } catch {}
+          finish(r);
+          controller.close();
+        } else {
+          try { feed(decoder.decode(value, { stream: true })); } catch {}
+          controller.enqueue(value);
+        }
+      } catch (error) {
+        finish(r, true);
+        controller.error(error);
       }
-
-      observe(() => {
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) handleLine(line);
-      });
-
-      controller.enqueue(value);
     },
-    cancel(reason) {
-      return reader.cancel(reason);
-    },
+    cancel(reason) { finish(r, true); return reader.cancel(reason); },
   });
 }
-
-// ═══════════════════════════════════════════════════════════════
-// Extension
-// ═══════════════════════════════════════════════════════════════
 
 export default function (pi: ExtensionAPI) {
   const globalState = globalThis as Record<PropertyKey, unknown>;
   const key = "llama-pp-persistent/loaded";
-
   if (globalState[key]) return;
   globalState[key] = true;
-
-  originalFetch = globalThis.fetch;
-
-  const patched = async (input: RequestInfo | URL, init?: RequestInit) => {
-    const host = llamaHost(input);
-    if (host === null) {
-      return originalFetch!(input, init);
+  const originalFetch = globalThis.fetch;
+  const patched = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    if (!promptActive || llamaHost(input) === null) return originalFetch(input, init);
+    const request = input instanceof Request ? input : null;
+    const payload = parsePayload(init?.body ?? (request ? await request.clone().text() : null));
+    if (!payload?.stream || (payload.n !== undefined && payload.n !== 1)) return originalFetch(input, init);
+    let r: RequestStats;
+    if (nativeHooks) {
+      if (!nativeRequest || !nativePayload || payload.model !== nativePayload.model ||
+          JSON.stringify(payload.messages) !== JSON.stringify(nativePayload.messages)) {
+        return originalFetch(input, init);
+      }
+      r = nativeRequest;
+    } else {
+      // Legacy hosts lack session-scoped provider callbacks. Restrict their
+      // hook to the active model and endpoint whenever the context supplies it.
+      if (activeModel?.id && payload.model !== activeModel.id) return originalFetch(input, init);
+      if (activeModel?.baseUrl) {
+        const raw = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        try {
+          const endpoint = new URL(activeModel.baseUrl);
+          const url = new URL(raw);
+          if (url.origin !== endpoint.origin || !url.pathname.startsWith(endpoint.pathname.replace(/\/$/, "") + "/")) {
+            return originalFetch(input, init);
+          }
+        } catch { return originalFetch(input, init); }
+      }
+      r = newRequest();
     }
-
-    enableProgress(init);
-    // Tokens per delta differ per engine: use this host's learned ratio.
-    engine.setTokenScale(tokensPerDelta.get(host) ?? 1);
-
-    const requestStart = Date.now();
-    const response = await originalFetch!(input, init);
-
-    if (response.ok && response.body) {
-      return new Response(capture(response.body, requestStart, host), {
-        status: response.status,
-        statusText: response.statusText,
-        headers: new Headers(response.headers),
-      });
-    }
-
-    return response;
+    const nextInit = { ...init, body: JSON.stringify(enableProgress(payload)) };
+    try {
+      const response = await originalFetch(input, nextInit);
+      if (response.ok && response.body && response.headers.get("content-type")?.includes("text/event-stream")) {
+        return new Response(capture(response.body, r), {
+          status: response.status, statusText: response.statusText, headers: new Headers(response.headers),
+        });
+      }
+      finish(r, true);
+      return response;
+    } catch (error) { finish(r, true); throw error; }
   };
   globalThis.fetch = patched;
 
   pi.on("session_start", (_event, ctx) => {
     uiRef = ctx.ui;
     hasUI = ctx.hasUI;
-    if (hasUI) {
-      renderStatus(true);
-      ctx.ui.setStatus(PAD_KEY, " ");
-    }
+    promptActive = false;
+    activeModel = ctx.model;
+    reset();
+    renderStatus(true);
+    if (hasUI) ctx.ui.setStatus(PAD_KEY, " ");
   });
-
   pi.on("before_agent_start", (_event, ctx) => {
     uiRef = ctx.ui;
     hasUI = ctx.hasUI;
-    // New user prompt: every accumulator starts fresh. A run that ended
-    // mid-tool-call (e.g. aborted) never saw its final agent_end, so the
-    // engine may still be running — it must not carry into this prompt.
-    tgAccum = { n: 0, us: 0 };
-    genericTg = { tokens: 0, us: 0 };
-    if (engine.isStreaming) engine.stop();
-    if (hasUI) {
-      ctx.ui.setStatus(PAD_KEY, " ");
+    activeModel = ctx.model;
+    reset();
+    promptActive = true;
+    renderStatus(true);
+    if (hasUI) ctx.ui.setStatus(PAD_KEY, " ");
+  });
+  pi.on("before_provider_request", (event) => {
+    if (!promptActive) return;
+    nativeHooks = true;
+    const payload = event.payload;
+    nativePayload = payload && typeof payload === "object" ? payload : null;
+    nativeRequest = newRequest();
+    if (nativePayload && (nativePayload as { stream?: boolean }).stream && activeModel?.baseUrl &&
+        llamaHost(`${activeModel.baseUrl.replace(/\/$/, "")}/chat/completions`) !== null) {
+      const next = enableProgress(nativePayload);
+      nativePayload = next;
+      return next; // Pi's callback returns the payload itself, not { payload }.
     }
   });
-
-  // Streaming lifecycle (ported from pi-token-speed EventManager)
-  pi.on("message_update", (event: MessageUpdateEvent) => {
-    const ev = event.assistantMessageEvent;
-    if (!ev) return;
-
-    if (
-      ev.type === "text_start" ||
-      ev.type === "thinking_start" ||
-      ev.type === "toolcall_start"
-    ) {
-      engine.start();
-      renderStatus();
-      return;
-    }
-
-    if (ev.type === "text_delta" || ev.type === "thinking_delta") {
-      engine.recordDelta();
-      renderStatus();
-      return;
-    }
-
-    if (ev.type === "toolcall_delta") {
-      // Count all tool-call argument tokens: usage.output includes them, so
-      // the counted total and the clock must agree on what was generated.
-      engine.recordDelta();
-      renderStatus();
-      return;
-    }
-
-    if (ev.type === "toolcall_end") {
-      // Pause covers exactly the dead time — tool execution + next prefill,
-      // from the last tool-call token to the next message's first token.
-      engine.pause();
+  pi.on("provider_stream_event", (event) => {
+    if (nativeRequest && promptActive) {
+      if (activeModel?.id && event.model !== activeModel.id) return;
+      try { observe(nativeRequest, event.data); } catch {}
     }
   });
-
-  pi.on("agent_end", (event: AgentEndEvent) => {
-    const messages = Array.isArray(event.messages) ? event.messages : [];
-
-    // omp fires agent_end after every assistant-message settle, passing the
-    // FULL session as `messages` — pi fires it once per prompt with the
-    // prompt's messages. A settle whose last assistant message still has tool
-    // calls, or that scheduled a continuation, is mid-prompt: keep the engine
-    // running so the final average spans the whole prompt, and skip the
-    // reconcile (which would otherwise divide a whole-session token total by
-    // the last message's time).
-    let midPrompt = event.willContinue === true;
-    if (!midPrompt) {
-      for (let i = messages.length - 1; i >= 0; i--) {
-        if (messages[i].role !== "assistant") continue;
-        midPrompt = messages[i].content?.some((c) => c.type === "toolCall") ?? false;
-        break;
-      }
+  pi.on("message_end", (event) => {
+    const message = event.message;
+    if (message.role === "assistant" && nativeRequest) {
+      finish(nativeRequest, message.stopReason === "error" || message.stopReason === "aborted");
     }
-    if (midPrompt) return;
-
-    engine.stop();
-
-    // Authoritative total for THIS prompt: usage of the messages after the
-    // last user message. In pi that is the original plugin's sum unchanged;
-    // in omp it excludes prior prompts that live in the session state.
-    let start = 0;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === "user") {
-        start = i + 1;
-        break;
-      }
+  });
+  pi.on("agent_end", (event) => {
+    // omp may emit agent_end mid-prompt. Measurements are request-scoped,
+    // so neither full-session usage nor toolResult usage is ever reconciled.
+    const messages = event.messages ?? [];
+    const last = [...messages].reverse().find((m) => m.role === "assistant");
+    const continuing = (event as { willContinue?: boolean }).willContinue === true ||
+      (last?.role === "assistant" && last.stopReason !== "aborted" && last.stopReason !== "error" &&
+       last.content.some((c) => c.type === "toolCall"));
+    if (!continuing) {
+      promptActive = false;
+      for (const r of requests) if (!r.finished) finish(r, true);
     }
-    let outputTokens = 0;
-    for (let i = start; i < messages.length; i++) {
-      const m = messages[i];
-      if (m.role === "assistant" || m.role === "toolResult") {
-        outputTokens += m.usage?.output ?? 0;
-      }
-    }
-    engine.reconcileTotal(outputTokens);
-
     renderStatus(true);
   });
-
-  pi.on("turn_end", (_event, ctx) => {
-    if (ctx.hasUI) {
-      ctx.ui.setWorkingMessage();
-    }
-  });
-
+  pi.on("turn_end", (_event, ctx) => { if (ctx.hasUI) ctx.ui.setWorkingMessage(); });
   pi.on("session_shutdown", () => {
-    engine.stop();
-    if (renderTimer) {
-      clearTimeout(renderTimer);
-      renderTimer = null;
+    promptActive = false;
+    reset();
+    if (globalThis.fetch === patched) {
+      globalThis.fetch = originalFetch;
+      delete globalState[key];
     }
-    // Only restore if our wrapper is still on top — never clobber a wrapper
-    // installed by another extension after us.
-    if (originalFetch && globalThis.fetch === patched) globalThis.fetch = originalFetch;
-    delete globalState[key];
+    // If a later extension still calls this wrapper, retain the guard: a
+    // re-registration must not put two observers into that wrapper chain.
   });
 }
