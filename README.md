@@ -10,15 +10,23 @@ counts.
 
 ## Accuracy
 
-**Version 0.5 uses server measurements only.** It does not count UI delta
-events as tokens, learn a multiplier from previous responses, or infer decode
-speed from network arrival times. Servers batch tokens and split text,
-reasoning, and tool calls differently; those methods could report 100+ t/s
-for a much slower response.
+**Server timing is authoritative.** The final value comes from the server;
+when the server omits live timing, a live delivery estimate is prefixed with
+`~` (for example, `Gen ~32.1 t/s`). Version 0.5.1 restores this live display
+for proxies that send `timings` only in the final chunk. It never learns a
+multiplier from a previous response or counts Pi UI events as tokens.
 
 - **Gen:** the server's `timings.predicted_per_second`. Live values are the
   server's cumulative measurements, updated with `timings_per_token: true`.
-  The final value uses the latest snapshot for each request. Across tool
+  When those fields are unavailable during streaming, the live estimate uses
+  the current response's cumulative completion-token counter if supplied;
+  otherwise it counts nonempty generated SSE frames once, including reasoning
+  and tool-call arguments. This is approximate because frames can batch tokens
+  and network delivery can arrive in bursts. Empty role/metadata frames do not
+  count. The clock starts at the first generated frame, excluding TTFT, with a
+  500 ms minimum denominator to smooth bursts. It is a current-response average,
+  not an instantaneous server decode rate. The final value uses the latest
+  server snapshot for each request. Across tool
   round trips, rates are weighted by `predicted_ms`, excluding tool execution
   and prefill. Repeated timing snapshots and `[DONE]` followed by EOF are
   counted once.
@@ -34,7 +42,10 @@ for a much slower response.
   cannot display 100%. Its rate uses the progress timer, which can differ
   from the final prompt-processing timer.
 
-An unavailable measurement displays **`--`**. A server without timing fields
+Before two generated frames establish a live interval, Gen displays `--`.
+While streaming, the current response's rate is shown even if an earlier tool
+round trip lacked timing. After completion, an unavailable server measurement
+displays **`--`**. A server without timing fields
 (e.g. many vLLM deployments and hosted APIs) supplies token counts but cannot
 supply exact speed through standard OpenAI usage fields. Generation is also
 unknown if a prompt includes a request with missing timings, fails, or is
@@ -78,9 +89,13 @@ completion requests:
 {
   "return_progress": true,
   "timings_per_token": true,
-  "stream_options": { "include_usage": true }
+  "stream_options": { "include_usage": true, "continuous_usage_stats": true }
 }
 ```
+
+`continuous_usage_stats` requests per-chunk cumulative token counts from
+backends that support it. A proxy may ignore that option and send usage/timings
+only at the end; live Gen then remains an explicitly marked estimate.
 
 The request must target `/chat/completions`. The options are applied to
 local/private hosts: localhost, *.localhost, *.local, 127.*, 10.*, 192.168.*,
@@ -146,7 +161,8 @@ bun run test
 ```
 
 The end-to-end harness uses a loopback HTTP SSE server and native provider
-callbacks. It covers server rate fidelity, cumulative snapshots, weighted
+callbacks. It covers positive live Gen with end-only timing, estimate markers,
+one-count-per-frame behavior, server rate fidelity, cumulative snapshots, weighted
 multi-request averages, missing/invalid measurements, cache counts, prefill
 progress, cancellation, stale responses, session isolation, Request-object
 bodies, response-byte preservation, and fetch teardown.

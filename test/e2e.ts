@@ -68,7 +68,7 @@ const number = (pattern: RegExp) => {
   const match = pattern.exec(line());
   return match ? Number(match[1]) : null;
 };
-const gen = () => number(/Gen\s+([\d.]+) t\/s/);
+const gen = () => number(/Gen\s+~?\s*([\d.]+) t\/s/);
 const pp = () => number(/Last Prompt\s+([\d.]+) t\/s/);
 let passed = 0;
 function assert(label: string, actual: unknown, expected: unknown) {
@@ -94,6 +94,7 @@ try {
   assert("requests ask for per-token server timings", bodies.at(-1).timings_per_token, true);
   assert("requests ask for server prompt progress", bodies.at(-1).return_progress, true);
   assert("requests preserve usage reporting", bodies.at(-1).stream_options.include_usage, true);
+  assert("requests ask for cumulative live usage", bodies.at(-1).stream_options.continuous_usage_stats, true);
   // A UI event may split a token, batch many tokens, or carry tool arguments.
   for (let i = 0; i < 200; i++) handlers.message_update?.({ assistantMessageEvent: { type: "toolcall_delta" } });
   end(100000);
@@ -227,6 +228,57 @@ try {
   native(); provider({ timings: { predicted_per_second: 40, predicted_n: 4 } });
   handlers.message_end({ message: { role: "assistant", stopReason: "stop" } }); end();
   assert("multiple requests need durations for a weighted rate", gen(), null);
+
+  // Regression: the router sends timing only on the terminal chunk. Live
+  // Gen must be nonzero while text/reasoning/tool arguments are arriving.
+  begin(); native();
+  provider({ choices: [{ delta: { role: "assistant", content: "" } }] });
+  provider({ choices: [{ delta: { tool_calls: [{ function: { name: "bash", arguments: "" } }] } }] });
+  await Bun.sleep(110);
+  assert("role and empty tool metadata do not create a live rate", gen(), null);
+  for (let i = 0; i < 30; i++) {
+    provider({ choices: [{ delta: { content: "text", reasoning_content: "think",
+      tool_calls: [{ function: { arguments: "arg" } }] } }] });
+    // Host fan-out and historical usage must never multiply a wire frame.
+    for (let j = 0; j < 3; j++) handlers.message_update?.({ assistantMessageEvent: { type: "text_delta" } });
+    await Bun.sleep(35);
+  }
+  await Bun.sleep(110);
+  assert("end-only timing backend shows a positive live estimate before completion", gen()! > 15 && gen()! < 40, true);
+  assert("live fallback is visibly marked as an estimate", /Gen\s+~/.test(line()), true);
+  assert("live estimate retains the status row width", line().length, placeholder.length);
+  provider(timing(32.4, 1000));
+  handlers.message_end({ message: { role: "assistant", stopReason: "stop" } }); end(90000);
+  assert("final server timing replaces the estimate without a marker", gen() === 32.4 && !/Gen\s+~/.test(line()), true);
+
+  // A missing earlier request must not suppress this response's live rate.
+  begin(); native();
+  provider({ choices: [{ delta: { content: "old" } }] });
+  handlers.message_end({ message: { role: "assistant", stopReason: "toolUse" } });
+  native(); provider(timing(27.1, 1000));
+  await Bun.sleep(110);
+  assert("current server live timing is visible despite missing earlier request timing", gen(), 27.1);
+  handlers.message_end({ message: { role: "assistant", stopReason: "stop" } }); end();
+  assert("settled aggregate still does not pretend missing requests were measured", gen(), null);
+
+  begin(); native();
+  for (const count of [3, 6, 9, 12]) {
+    provider({ choices: [{ delta: { content: "batched" } }], usage: { completion_tokens: count } });
+    await Bun.sleep(100);
+  }
+  await Bun.sleep(110);
+  assert("cumulative token counters are differenced, never added", gen()! >= 14 && gen()! < 20, true);
+  handlers.message_end({ message: { role: "assistant", stopReason: "aborted" } }); end();
+
+  begin(); native();
+  provider({ choices: [{ delta: { content: "counted" } }], usage: { completion_tokens: 3 } });
+  for (let i = 0; i < 6; i++) {
+    provider({ choices: [{ delta: { content: "uncounted" } }] });
+    await Bun.sleep(25);
+  }
+  await Bun.sleep(110);
+  assert("intermittent usage cannot leave live Gen blank while output continues", gen()! > 0 && /Gen\s+~/.test(line()), true);
+  handlers.message_end({ message: { role: "assistant", stopReason: "aborted" } }); end();
 
   // A stats/UI failure must never corrupt the model's bytes.
   begin(); native(); workingThrows = true;

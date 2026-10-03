@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-// Only server measurements are displayed. Stream chunks, UI delta events,
-// network arrival times, and previous responses cannot establish token speed.
+// Server timing is authoritative. When an endpoint reports it only at the
+// end, show a clearly marked live delivery estimate for the current request.
 interface UiRef {
   setStatus: (key: string, text?: string) => void;
   setWorkingMessage: (text?: string) => void;
@@ -15,6 +15,14 @@ interface RequestStats {
   epoch: number;
   gen: { rate: number; ms: number | null } | null;
   prompt: PpStats | null;
+  hasFetchObserver: boolean;
+  live: {
+    firstAt: number | null;
+    frames: number;
+    firstTokens: number | null;
+    tokens: number | null;
+    cumulativeUsage: boolean;
+  };
   finished: boolean;
   failed: boolean;
 }
@@ -139,9 +147,10 @@ function shown(v: number): number {
   return Math.round(v * 10) / 10;
 }
 
-function formatGen(tps: number | null): string {
+function formatGen(tps: number | null, estimated = false): string {
   if (tps === null) return pad(PLACEHOLDER, GEN_WIDTH);
-  return colorHex(formatRate(tps, GEN_WIDTH), tpsColor(shown(tps)));
+  const text = estimated ? `~${formatRate(tps, GEN_WIDTH - 1)}` : formatRate(tps, GEN_WIDTH);
+  return colorHex(text, tpsColor(shown(tps)));
 }
 
 function formatPrompt(s: PpStats | null): string {
@@ -187,6 +196,25 @@ function generationRate(): number | null {
   return ms > 0 ? work / ms : null;
 }
 
+/** Live refers to the current response, not earlier tool round trips. */
+function displayedGeneration(): { rate: number | null; estimated: boolean } {
+  const active = requests.at(-1);
+  if (active && !active.finished && !active.failed) {
+    if (active.gen) return { rate: active.gen.rate, estimated: false };
+    const live = active.live;
+    if (live.firstAt !== null && live.frames >= 2) {
+      // A half-second minimum smooths bursts from a proxy or speculative decode.
+      // TTFT is excluded. Nothing is learned from earlier requests or models.
+      const ms = Math.max(performance.now() - live.firstAt, 500);
+      const n = live.cumulativeUsage && live.tokens !== null && live.firstTokens !== null
+        ? live.tokens - live.firstTokens : live.frames - 1;
+      if (n > 0) return { rate: 1000 * n / ms, estimated: true };
+    }
+    return { rate: null, estimated: false };
+  }
+  return { rate: generationRate(), estimated: false };
+}
+
 const RENDER_INTERVAL_MS = 100;
 let lastRender = 0;
 let renderTimer: ReturnType<typeof setTimeout> | null = null;
@@ -204,15 +232,19 @@ function renderStatus(force = false): void {
   renderTimer = null;
   lastRender = now;
   try {
+    const gen = displayedGeneration();
     uiRef.setStatus(STATUS_KEY,
-      ` ⚡ Gen ${formatGen(generationRate())} t/s | Last Prompt ${formatPrompt(ppStats)}`);
+      ` ⚡ Gen ${formatGen(gen.rate, gen.estimated)} t/s | Last Prompt ${formatPrompt(ppStats)}`);
   } catch {}
 }
 function current(r: RequestStats): boolean {
   return r.epoch === epoch && requests.includes(r);
 }
 function newRequest(): RequestStats {
-  const r: RequestStats = { epoch, gen: null, prompt: null, finished: false, failed: false };
+  const r: RequestStats = {
+    epoch, gen: null, prompt: null, finished: false, failed: false, hasFetchObserver: false,
+    live: { firstAt: null, frames: 0, firstTokens: null, tokens: null, cumulativeUsage: false },
+  };
   requests.push(r);
   renderStatus(true);
   return r;
@@ -271,7 +303,7 @@ function enableProgress(payload: Record<string, any>): Record<string, any> {
     ...payload,
     return_progress: true,
     timings_per_token: true,
-    stream_options: { ...payload.stream_options, include_usage: true },
+    stream_options: { ...payload.stream_options, include_usage: true, continuous_usage_stats: true },
   };
 }
 function parsePayload(body: unknown): Record<string, any> | null {
@@ -282,9 +314,49 @@ function parsePayload(body: unknown): Record<string, any> | null {
   } catch { return null; }
 }
 
+function generatedFrame(chunk: any): boolean {
+  // One wire frame can split into multiple Pi UI events. Count it once, and
+  // exclude role-only, usage-only, finish, and empty tool-call metadata frames.
+  return Array.isArray(chunk.choices) && chunk.choices.some((c: any) => {
+    const d = c?.delta;
+    if (!d || typeof d !== "object") return false;
+    if ([d.content, d.reasoning_content, d.reasoning, d.reasoning_text]
+      .some((v) => typeof v === "string" && v.length > 0)) return true;
+    return Array.isArray(d.tool_calls) && d.tool_calls.some((t: any) =>
+      typeof t?.function?.arguments === "string" && t.function.arguments.length > 0 ||
+      typeof t?.custom?.input === "string" && t.custom.input.length > 0);
+  });
+}
+
 /** Timings are cumulative per request. Replace snapshots; never add them. */
 function observe(r: RequestStats, chunk: any): void {
   if (!current(r) || r.finished || !chunk || typeof chunk !== "object") return;
+  if (generatedFrame(chunk)) {
+    const live = r.live;
+    const now = performance.now();
+    live.firstAt ??= now;
+    live.frames++;
+    const tokens = tokenCount(chunk.usage?.completion_tokens);
+    if (tokens !== null && tokens > 0) {
+      if (!live.cumulativeUsage || live.tokens === null || tokens < live.tokens) {
+        // Anchor a fresh counter interval if usage first appears mid-response
+        // or a malformed server counter regresses. Never sum cumulative usage.
+        live.firstAt = now;
+        live.frames = 1;
+        live.firstTokens = tokens;
+      }
+      live.cumulativeUsage = true;
+      live.tokens = tokens;
+    } else if (live.cumulativeUsage) {
+      // Partial usage forwarding must not freeze the numerator while output
+      // keeps arriving. Start a fresh, explicitly approximate frame interval.
+      live.cumulativeUsage = false;
+      live.firstTokens = null;
+      live.tokens = null;
+      live.firstAt = now;
+      live.frames = 1;
+    }
+  }
   const t = chunk.timings;
   if (t && typeof t === "object") {
     if ("predicted_per_second" in t || "predicted_n" in t || "predicted_ms" in t) {
@@ -352,6 +424,7 @@ function finish(r: RequestStats, failed = false): void {
 
 /** Parse SSE independently, forwarding the original bytes and cancellation. */
 function capture(body: ReadableStream<Uint8Array>, r: RequestStats): ReadableStream<Uint8Array> {
+  r.hasFetchObserver = true;
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -481,7 +554,7 @@ export default function (pi: ExtensionAPI) {
     }
   });
   pi.on("provider_stream_event", (event) => {
-    if (nativeRequest && promptActive) {
+    if (nativeRequest && promptActive && !nativeRequest.hasFetchObserver) {
       if (activeModel?.id && event.model !== activeModel.id) return;
       try { observe(nativeRequest, event.data); } catch {}
     }
