@@ -453,7 +453,10 @@ function observe(r: RequestStats, chunk: any): void {
       r.prompt ??= { pp: null, newTokens: total - cache, cached: cache };
     }
   }
-  if (chunk.prompt_progress && hasUI && uiRef) {
+  // Prefill progress is a measurement, not only a progress bar. llama.cpp
+  // reports `timings` on the terminal chunk, so without this the finished
+  // prefill would stay unpublished until the whole response streamed out.
+  if (chunk.prompt_progress) {
     const p = chunk.prompt_progress;
     const processed = tokenCount(p.processed);
     const cached = tokenCount(p.cache);
@@ -461,13 +464,25 @@ function observe(r: RequestStats, chunk: any): void {
     const ms = positive(p.time_ms);
     if (processed !== null && cached !== null && total !== null &&
         cached <= processed && processed <= total) {
+      const n = processed - cached;
       if (processed < total) {
-        const n = processed - cached;
-        const pct = Math.floor(100 * n / (total - cached));
-        const rate = n > 0 && ms !== null ? formatRate(rateTenths(n, ms * 1000), PROMPT_WIDTH)
-          : pad(PLACEHOLDER, PROMPT_WIDTH);
-        uiRef.setWorkingMessage(`Prefilling... ${pad(String(pct), 2)}% · ${rate} t/s`);
-      } else uiRef.setWorkingMessage();
+        // Live view only: an unfinished prefill is not a throughput sample.
+        if (hasUI && uiRef) {
+          const pct = Math.floor(100 * n / (total - cached));
+          const rate = n > 0 && ms !== null ? formatRate(rateTenths(n, ms * 1000), PROMPT_WIDTH)
+            : pad(PLACEHOLDER, PROMPT_WIDTH);
+          try { uiRef.setWorkingMessage(`Prefilling... ${pad(String(pct), 2)}% · ${rate} t/s`); } catch {}
+        }
+      } else {
+        // The prefill is complete, so publish it now: Last Prompt is then ready
+        // before the first token. The server's own prompt rate still wins when
+        // its terminal timings arrive, because it owns that timer.
+        const rate = n > 0 && ms !== null ? rateTenths(n, ms * 1000) : null;
+        if (!r.prompt || (r.prompt.pp === null && rate !== null)) {
+          r.prompt = { pp: rate, newTokens: n, cached: cached };
+        }
+        if (hasUI && uiRef) { try { uiRef.setWorkingMessage(); } catch {} }
+      }
     }
   }
   applyPrompt(r);
@@ -477,7 +492,13 @@ function finish(r: RequestStats, failed = false): void {
   if (!current(r) || r.finished) return;
   r.finished = true;
   r.failed = failed;
-  if (failed) { r.gen = null; r.prompt = null; }
+  if (failed) {
+    r.gen = null;
+    // Decode that stopped early measured nothing useful, but a prefill that
+    // reported completion did: it happened, on this server, for that long. An
+    // unmeasured or partial prompt is still dropped.
+    if (!r.prompt || r.prompt.pp === null) r.prompt = null;
+  }
   applyPrompt(r);
   if (requests.at(-1) === r) clearWorking();
   renderStatus(true);

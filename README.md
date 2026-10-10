@@ -15,9 +15,10 @@ when the server omits live timing, a live delivery estimate is prefixed with
 `~` (for example, `Gen ~32.1 t/s`). Version 0.5.1 restores this live display
 for proxies that send `timings` only in the final chunk, version 0.5.2
 keeps the last prompt measurement visible while the next one is still being
-computed, and version 0.5.3 stops coloring a nearly cached prompt red. None of
-them ever learns a multiplier from a previous response or counts Pi UI events
-as tokens.
+computed, version 0.5.3 stops coloring a nearly cached prompt red, and version
+0.5.4 publishes it as soon as prefill finishes instead of waiting for the end
+of the response. None of them ever learns a multiplier from a previous response
+or counts Pi UI events as tokens.
 
 - **Gen:** the server's `timings.predicted_per_second`. Live values are the
   server's cumulative measurements, updated with `timings_per_token: true`.
@@ -47,14 +48,19 @@ as tokens.
   mostly-overhead milliseconds and reports a low rate for a server that is
   otherwise fast. The red warning therefore keys on the size of the sample
   rather than the cache percentage, which would also hide a large prefill that
-  genuinely stalled.
+  genuinely stalled. The value is published the moment `prompt_progress` reports
+  the prefill complete, so it is on screen while the model is still answering;
+  the server's terminal `timings` figure then replaces it, because the server
+  owns that timer.
 - **Cache:** `cache_n / (prompt_n + cache_n)`. When timing fields are absent,
   `usage.prompt_tokens_details.cached_tokens` and `usage.prompt_tokens` can
   still establish the exact cache/new token counts.
 - **Prefill progress:** `(processed - cache) / (total - cache)` from the
   server's `prompt_progress`. Percentages are floored so incomplete work
   cannot display 100%. Its rate uses the progress timer, which can differ
-  from the final prompt-processing timer.
+  from the final prompt-processing timer, so an unfinished progress frame is
+  never published as a measurement — only the frame that reports the prefill
+  complete.
 
 Before two generated frames establish a live interval, Gen displays `--`.
 While streaming, the current response's rate is shown even if an earlier tool
@@ -63,7 +69,9 @@ displays **`--`**. A server without timing fields
 (e.g. many vLLM deployments and hosted APIs) supplies token counts but cannot
 supply exact speed through standard OpenAI usage fields. Generation is also
 unknown if a prompt includes a request with missing timings, fails, or is
-cancelled. A multi-request average requires every request's decode duration.
+cancelled. A multi-request average requires every request's decode duration. A
+request that fails after its prefill completed keeps that prompt measurement,
+because the work really happened; only an unfinished one is discarded.
 
 The server defines its rate: llama.cpp builds differ in whether the decode
 numerator is `predicted_n` or `predicted_n - 1`. The extension copies the
@@ -185,7 +193,8 @@ multi-request averages, missing/invalid measurements, cache counts, prefill
 progress, cancellation, stale responses, session isolation, Request-object
 bodies, a Last Prompt value that survives the requests and prompts it is
 waiting to be replaced by, model and server switches, the slow-prompt color
-gate, response-byte preservation, and fetch teardown.
+gate, a prompt measurement published at the end of prefill and refined by the
+terminal timings, response-byte preservation, and fetch teardown.
 
 ## License
 

@@ -194,6 +194,51 @@ try {
     ["Prefilling...  5% · 2000.0 t/s", "Prefilling... 99% · 1992.0 t/s"]);
   assert("prefill working message clears at completion", working, undefined);
 
+  // Prefill ends before the first token, so its measurement must not wait for
+  // the terminal timings chunk: Last Prompt has to be ready while the model
+  // is still answering, not only after it finished.
+  handlers.session_start({}, ctx);
+  scripts.set("/prefilled/chat/completions", [
+    sse({ prompt_progress: { processed: 500, cache: 0, total: 1000, time_ms: 250 } }),
+    sse({ prompt_progress: { processed: 1000, cache: 0, total: 1000, time_ms: 500 } }),
+    sse({ choices: [{ delta: { content: "a" } }] }),
+  ]);
+  begin();
+  const prefill = await fetch(url("/prefilled/chat/completions"), {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const prefillReader = prefill.body!.getReader();
+  for (let i = 0; i < 3; i++) { await prefillReader.read(); await Bun.sleep(20); }
+  await Bun.sleep(110);
+  assert("a finished prefill fills Last Prompt while tokens still stream",
+    pp() === 2000 && gen() === null, true);
+  await prefillReader.cancel(); end();
+  assert("a cancelled response keeps its completed prefill measurement", pp(), 2000);
+
+  scripts.set("/progress-timings/chat/completions", [
+    sse({ prompt_progress: { processed: 1000, cache: 100, total: 1000, time_ms: 500 } }),
+    sse({ timings: { predicted_per_second: 30, predicted_ms: 1000, prompt_n: 900,
+      prompt_ms: 562, prompt_per_second: 1600, cache_n: 100 } }), DONE,
+  ]);
+  handlers.session_start({}, ctx);
+  begin(); await post("/progress-timings/chat/completions"); end();
+  assert("the server's own prompt rate replaces the progress figure", pp(), 1600);
+  scripts.set("/both/chat/completions", [sse({
+    prompt_progress: { processed: 1000, cache: 100, total: 1000, time_ms: 500 },
+    timings: { predicted_per_second: 30, predicted_ms: 1000, prompt_n: 900,
+      prompt_ms: 562, prompt_per_second: 1600, cache_n: 100 },
+  }), DONE]);
+  handlers.session_start({}, ctx);
+  begin(); await post("/both/chat/completions"); end();
+  assert("progress cannot overwrite the server rate inside one chunk", pp(), 1600);
+
+  scripts.set("/partial/chat/completions", [
+    sse({ prompt_progress: { processed: 500, cache: 0, total: 1000, time_ms: 250 } }), DONE,
+  ]);
+  handlers.session_start({}, ctx);
+  begin(); await post("/partial/chat/completions"); end();
+  assert("an unfinished prefill is never published as a rate", pp() === null, true);
+
   const pretty = JSON.stringify(timing(33.3, 1000), null, 2).split("\n").map((s) => `data:${s}\r\n`).join("") + "\r\n";
   const splitAt = Math.floor(pretty.length / 2);
   scripts.set("/multiline/chat/completions", [pretty.slice(0, splitAt), pretty.slice(splitAt), "data:[DONE]\r\n\r\n"]);
