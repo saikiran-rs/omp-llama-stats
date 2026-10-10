@@ -17,10 +17,14 @@ for proxies that send `timings` only in the final chunk, version 0.5.2
 keeps the last prompt measurement visible while the next one is still being
 computed, version 0.5.3 stops coloring a nearly cached prompt red, and version
 0.5.4 publishes it as soon as prefill finishes instead of waiting for the end
-of the response. None of them ever learns a multiplier from a previous response
-or counts Pi UI events as tokens.
+of the response, and version 0.6.0 stops generation speed blanking between
+requests and prompts, marking a held value `·` and blinking the live estimate.
+None of them ever learns a multiplier from a previous response or counts Pi UI
+events as tokens.
 
-- **Gen:** the server's `timings.predicted_per_second`. Live values are the
+- **Gen:** the server's `timings.predicted_per_second`. When nothing has been
+  measured yet on this endpoint it shows `--`; afterwards it never blanks, see
+  **Display** for the three markers. Live values are the
   server's cumulative measurements, updated with `timings_per_token: true`.
   When those fields are unavailable during streaming, the live estimate uses
   the current response's cumulative completion-token counter if supplied;
@@ -62,14 +66,28 @@ or counts Pi UI events as tokens.
   never published as a measurement — only the frame that reports the prefill
   complete.
 
-Before two generated frames establish a live interval, Gen displays `--`.
-While streaming, the current response's rate is shown even if an earlier tool
-round trip lacked timing. After completion, an unavailable server measurement
-displays **`--`**. A server without timing fields
-(e.g. many vLLM deployments and hosted APIs) supplies token counts but cannot
+A marker says where the generation number came from:
+
+| Shows | Meaning |
+| --- | --- |
+| `Gen 34.9 t/s` | this response, measured by the server |
+| `Gen ~34.9 t/s` | this response, live delivery estimate — the `~` **blinks while generating** |
+| `Gen ·34.9 t/s` | **held**: the last rate this endpoint measured, nothing current yet |
+
+Only a session's first response can show `--` for Gen, and only until it is
+measured: before two generated frames establish a live interval, the line holds
+the previous measurement instead of blanking. Between tool round trips, at the
+start of a new prompt, and after an aborted or unmeasured request, the held
+rate shows with `·`. A model or endpoint switch and a new session clear it, so a
+number is never inherited by a different server. While streaming, the current
+response's rate is shown even if an earlier tool round trip lacked timing. The
+final value is `--` only when nothing has ever been measured here: a server
+without timing fields (e.g. many vLLM deployments and hosted APIs) supplies
+token counts but cannot
 supply exact speed through standard OpenAI usage fields. Generation is also
 unknown if a prompt includes a request with missing timings, fails, or is
-cancelled. A multi-request average requires every request's decode duration. A
+cancelled, so its aggregate is not reported; the held rate stays visible. A
+multi-request average requires every request's decode duration. A
 request that fails after its prefill completed keeps that prompt measurement,
 because the work really happened; only an unfinished one is discarded.
 
@@ -148,8 +166,9 @@ endpoint when supplied by the host. Such hosts cannot distinguish a side
 request using that same model and endpoint; use a host with native provider
 hooks when running concurrent requests in the same process.
 
-A new prompt clears generation measurements; a new session clears every
-measurement, including the retained prompt rate. Each prompt measurement
+A new prompt clears the *live* generation aggregate; a new session clears
+every measurement. Both metrics then keep showing the last value their endpoint
+measured, marked `·` for generation, until a newer one replaces it. Each measurement
 carries the model and endpoint that produced it, so switching either hides the
 old number before a frame can be mistaken for the new server's. Request records are tagged with
 a generation number, so late responses from an earlier prompt cannot overwrite
@@ -170,7 +189,13 @@ rate 6, cache percentage 5, and token counts 5. Large rates drop their decimal
 when needed; extreme values can exceed the slot. Token counts below 1000
 are integers; larger counts use K/M abbreviations.
 
-Unknown values remain `--`, including absent cache counts. A fully cached
+Unknown values remain `--`, including absent cache counts. Both markers consume
+a digit of their slot, so `Gen ~34.9` and `Gen ·34.9` occupy exactly the width
+of `Gen 34.9` and the row never reflows while the `~` blinks. The blink is a
+toggled character re-rendered every 450 ms, deliberately not the ANSI blink
+attribute: pi rebuilds styles through its theme layer, omp may strip ANSI, and
+Terminal.app ignores SGR 5, so an attribute-based blink would silently stop
+signalling. A fully cached
 prompt shows a 100.0% cache hit and no processing rate. Gen colors are red
 below 15, orange from 15, green from 30, and blue from 45 t/s. Prompt rates
 below 15 t/s are red once at least 100 new tokens were processed; see
@@ -194,7 +219,8 @@ progress, cancellation, stale responses, session isolation, Request-object
 bodies, a Last Prompt value that survives the requests and prompts it is
 waiting to be replaced by, model and server switches, the slow-prompt color
 gate, a prompt measurement published at the end of prefill and refined by the
-terminal timings, response-byte preservation, and fetch teardown.
+terminal timings, the held and blinking generation markers, response-byte
+preservation, and fetch teardown.
 
 ## License
 

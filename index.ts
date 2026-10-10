@@ -37,6 +37,10 @@ let ppStats: PpStats | null = null;
 // The endpoint and model that produced ppStats. Prompt speed describes that
 // server, so it is retained across prompts until a measurement replaces it.
 let ppTarget = "";
+// The last server-measured generation rate for the current endpoint, held so
+// the line never blanks between responses. Cleared by the same switches that
+// clear ppTarget.
+let genHeld: { rate: number; target: string } | null = null;
 let epoch = 0;
 let promptActive = false;
 let activeModel: { id?: string; baseUrl?: string } | undefined;
@@ -157,10 +161,38 @@ function shown(v: number): number {
   return Math.round(v * 10) / 10;
 }
 
-function formatGen(tps: number | null, estimated = false): string {
-  if (tps === null) return pad(PLACEHOLDER, GEN_WIDTH);
-  const text = estimated ? `~${formatRate(tps, GEN_WIDTH - 1)}` : formatRate(tps, GEN_WIDTH);
-  return colorHex(text, tpsColor(shown(tps)));
+/**
+ * Rate slots. `~` marks a live delivery estimate for the response in flight and
+ * blinks while it holds; `·` marks a held value from an earlier response on the
+ * same endpoint, which stays steady. Both consume a digit of the slot, so the
+ * row width never changes. A bare number is the server's own measurement of the
+ * current response.
+ */
+function formatGen(g: { rate: number | null; mode: GenMode }): string {
+  if (g.rate === null) return pad(PLACEHOLDER, GEN_WIDTH);
+  const mark = g.mode === "estimate" ? (blinkOn ? "~" : FIGURE_SPACE) : g.mode === "held" ? "·" : "";
+  const text = mark + formatRate(g.rate, GEN_WIDTH - mark.length);
+  return colorHex(text, tpsColor(shown(g.rate)));
+}
+
+// Blinking is done by re-rendering, not with the ANSI blink attribute: pi
+// rebuilds styles through its theme layer and omp may strip ANSI, and Terminal
+// app ignores SGR 5 outright. A toggled character survives all three.
+const BLINK_MS = 450;
+let blinkOn = true;
+let blinkTimer: ReturnType<typeof setTimeout> | null = null;
+function syncBlink(mode: GenMode, showing: boolean): void {
+  if (mode === "estimate" && showing) {
+    blinkTimer ??= setTimeout(() => {
+      blinkTimer = null;
+      blinkOn = !blinkOn;
+      renderStatus(true);
+    }, BLINK_MS);
+  } else if (blinkTimer) {
+    clearTimeout(blinkTimer);
+    blinkTimer = null;
+    blinkOn = true;
+  }
 }
 
 function formatPrompt(s: PpStats | null): string {
@@ -195,6 +227,9 @@ function positive(v: unknown): number | null {
   return isNum(v) && v > 0 ? v : null;
 }
 
+/** Where a displayed generation rate came from. */
+type GenMode = "live" | "estimate" | "held";
+
 /** Server rates weighted by server decode duration, with no missing requests. */
 function generationRate(): number | null {
   if (!requests.length || requests.some((r) => r.failed || r.gen === null)) return null;
@@ -210,10 +245,10 @@ function generationRate(): number | null {
 }
 
 /** Live refers to the current response, not earlier tool round trips. */
-function displayedGeneration(): { rate: number | null; estimated: boolean } {
+function displayedGeneration(): { rate: number | null; mode: GenMode } {
   const active = requests.at(-1);
   if (active && !active.finished && !active.failed) {
-    if (active.gen) return { rate: active.gen.rate, estimated: false };
+    if (active.gen) return { rate: active.gen.rate, mode: "live" };
     const live = active.live;
     if (live.firstAt !== null && live.frames >= 2) {
       // A half-second minimum smooths bursts from a proxy or speculative decode.
@@ -221,11 +256,31 @@ function displayedGeneration(): { rate: number | null; estimated: boolean } {
       const ms = Math.max(performance.now() - live.firstAt, 500);
       const n = live.cumulativeUsage && live.tokens !== null && live.firstTokens !== null
         ? live.tokens - live.firstTokens : live.frames - 1;
-      if (n > 0) return { rate: 1000 * n / ms, estimated: true };
+      if (n > 0) return { rate: 1000 * n / ms, mode: "estimate" };
     }
-    return { rate: null, estimated: false };
+    // Waiting on this response's first measurement: hold the last real one
+    // rather than blanking the line.
+    return { rate: heldGeneration(), mode: "held" };
   }
-  return { rate: generationRate(), estimated: false };
+  const rate = generationRate();
+  if (rate !== null) return { rate, mode: "live" };
+  return { rate: heldGeneration(), mode: "held" };
+}
+
+/**
+ * The last server-measured rate this endpoint produced. A prompt whose
+ * aggregate is unprovable (an unmeasured or failed round trip) keeps whatever
+ * was last honest instead of showing nothing.
+ */
+function heldGeneration(): number | null {
+  if (!genHeld) return null;
+  const active = requests.at(-1);
+  if (active && !sameTarget(genHeld.target, active.target)) return null;
+  return genHeld.rate;
+}
+function holdGeneration(): void {
+  const rate = generationRate();
+  if (rate !== null) genHeld = { rate, target: requests.at(-1)?.target ?? "" };
 }
 
 const RENDER_INTERVAL_MS = 100;
@@ -247,8 +302,9 @@ function renderStatus(force = false): void {
   try {
     const gen = displayedGeneration();
     uiRef.setStatus(STATUS_KEY,
-      ` ⚡ Gen ${formatGen(gen.rate, gen.estimated)} t/s | Last Prompt ${formatPrompt(ppStats)}`);
-  } catch {}
+      ` ⚡ Gen ${formatGen(gen)} t/s | Last Prompt ${formatPrompt(ppStats)}`);
+    syncBlink(gen.mode, gen.rate !== null);
+  } catch { syncBlink("live", false); }
 }
 function current(r: RequestStats): boolean {
   return r.epoch === epoch && requests.includes(r);
@@ -292,11 +348,11 @@ function applyPrompt(r: RequestStats): void {
  * described the new server.
  */
 function retargetPrompt(): void {
-  if (!ppStats) return;
   const next = targetId(activeModel?.id, hostOf(activeModel?.baseUrl));
-  if (!sameTarget(ppTarget, next)) {
+  if ((ppStats && !sameTarget(ppTarget, next)) || (genHeld && !sameTarget(genHeld.target, next))) {
     ppStats = null;
     ppTarget = "";
+    genHeld = null;
   }
 }
 
@@ -319,6 +375,9 @@ function reset(): void {
   nativePayload = null;
   if (renderTimer) clearTimeout(renderTimer);
   renderTimer = null;
+  if (blinkTimer) clearTimeout(blinkTimer);
+  blinkTimer = null;
+  blinkOn = true;
   clearWorking();
 }
 /** A new session can point at another server and model, so nothing carries over. */
@@ -326,6 +385,7 @@ function newSession(): void {
   reset();
   ppStats = null;
   ppTarget = "";
+  genHeld = null;
 }
 
 function isLocalHost(hostname: string): boolean {
@@ -501,6 +561,7 @@ function finish(r: RequestStats, failed = false): void {
   }
   applyPrompt(r);
   if (requests.at(-1) === r) clearWorking();
+  holdGeneration();
   renderStatus(true);
 }
 

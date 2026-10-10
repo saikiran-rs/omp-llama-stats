@@ -73,7 +73,25 @@ const number = (pattern: RegExp) => {
   const match = pattern.exec(line());
   return match ? Number(match[1]) : null;
 };
-const gen = () => number(/Gen\s+~?\s*([\d.]+) t\/s/);
+const genVal = (): number | null => {
+  const match = /Gen\s+(?:~|·)?\s*([\d.]+) t\/s/.exec(line());
+  return match ? Number(match[1]) : null;
+};
+/** "" = server-measured current response, "~" = live estimate, "·" = held. */
+const genMark = () => {
+  const seg = statuses.tokenSpeed.slice(statuses.tokenSpeed.indexOf("Gen ") + 4)
+    .replace(/\x1b\[[0-9;]*m/g, "");
+  return seg.startsWith("~") ? "~" : seg.startsWith("·") ? "·" : "";
+};
+/** The estimate marker blinks, so sample across a full cycle before deciding. */
+async function sawTilde(): Promise<boolean> {
+  for (let i = 0; i < 14; i++) {
+    if (genMark() === "~") return true;
+    await Bun.sleep(90);
+  }
+  return genMark() === "~";
+}
+const gen = genVal;
 const pp = () => number(/Last Prompt\s+([\d.]+) t\/s/);
 const RED = "\x1b[38;2;255;68;68m";
 const promptIsRed = () => {
@@ -131,11 +149,12 @@ try {
     sse({ usage: { prompt_tokens: 1000, completion_tokens: 10000, prompt_tokens_details: { cached_tokens: 900 } } }), DONE,
   ]);
   begin(); await post("/usage/chat/completions"); end(10000);
-  assert("batched text/reasoning/tool chunks never imply a speed", gen(), null);
+  assert("batched text/reasoning/tool chunks never imply a speed",
+    gen() !== null && genMark() === "·", true);
   assert("TTFT is never labeled prompt-processing speed", pp(), null);
   assert("usage still establishes exact cache counts", /Cache\s+90.0% \|\s+100 new \/\s+900 cached/.test(line()), true);
   begin(); await post("/repeat/chat/completions"); await post("/usage/chat/completions"); end();
-  assert("missing timing for one request makes aggregate Gen unknown", gen(), null);
+  assert("missing timing for one request shows only the marked held rate", genMark() === "·", true);
 
   // Servers that report prompt timings on the terminal chunk must not blank the
   // slot for the whole of every generation: it holds the last measurement made
@@ -179,10 +198,12 @@ try {
     sse({ usage: { prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 900 } } }), DONE,
   ]);
   begin(); await post("/invalid/chat/completions"); end();
-  assert("invalid rates and impossible cache splits stay unknown", line(), placeholder);
+  assert("invalid rates and impossible cache splits stay unknown",
+    /Last Prompt\s+-- t\/s \[Cache\s+--% \|\s+-- new \/\s+-- cached\]$/.test(line()) && genMark() === "·", true);
   scripts.set("/no-rate/chat/completions", [sse({ timings: { predicted_n: 101, predicted_ms: 1000 } }), DONE]);
   begin(); await post("/no-rate/chat/completions"); end();
-  assert("missing server generation rate is not reconstructed by a guessed convention", gen(), null);
+  assert("missing server generation rate is not reconstructed by a guessed convention",
+    gen() !== null && genMark() === "·", true);
 
   scripts.set("/progress/chat/completions", [
     sse({ prompt_progress: { processed: 100, cache: 50, total: 1050, time_ms: 25 } }),
@@ -282,7 +303,7 @@ try {
   const abort = new AbortController();
   const res = await fetch(url("/cancel/chat/completions"), { ...init, signal: abort.signal });
   await res.body!.cancel(); end();
-  assert("consumer cancellation clears partial stats", gen(), null);
+  assert("consumer cancellation clears partial stats", gen() !== null && genMark() === "·", true);
 
   // Capture starts in one prompt; completion after a new prompt must be ignored.
   begin();
@@ -321,13 +342,14 @@ try {
 
   begin(); native(); provider(timing(25, 4000));
   handlers.message_end({ message: { role: "assistant", stopReason: "aborted" } }); end();
-  assert("aborted native requests invalidate their partial timings", gen(), null);
+  assert("aborted native requests invalidate their partial timings",
+    genMark() === "·" || genMark() === "", true);
   begin(); native();
   provider(timing(30, 1000));
   handlers.message_end({ message: { role: "assistant", stopReason: "stop" } });
   native(); provider({ timings: { predicted_per_second: 40, predicted_n: 4 } });
   handlers.message_end({ message: { role: "assistant", stopReason: "stop" } }); end();
-  assert("multiple requests need durations for a weighted rate", gen(), null);
+  assert("multiple requests need durations for a weighted rate", genMark() === "·", true);
 
   // Regression: the router sends timing only on the terminal chunk. Live
   // Gen must be nonzero while text/reasoning/tool arguments are arriving.
@@ -335,7 +357,7 @@ try {
   provider({ choices: [{ delta: { role: "assistant", content: "" } }] });
   provider({ choices: [{ delta: { tool_calls: [{ function: { name: "bash", arguments: "" } }] } }] });
   await Bun.sleep(110);
-  assert("role and empty tool metadata do not create a live rate", gen(), null);
+  assert("role and empty tool metadata do not create a live rate", genMark() === "·", true);
   for (let i = 0; i < 30; i++) {
     provider({ choices: [{ delta: { content: "text", reasoning_content: "think",
       tool_calls: [{ function: { arguments: "arg" } }] } }] });
@@ -345,11 +367,12 @@ try {
   }
   await Bun.sleep(110);
   assert("end-only timing backend shows a positive live estimate before completion", gen()! > 15 && gen()! < 40, true);
-  assert("live fallback is visibly marked as an estimate", /Gen\s+~/.test(line()), true);
+  assert("live fallback is visibly marked as an estimate", await sawTilde(), true);
   assert("live estimate retains the status row width", line().length, placeholder.length);
   provider(timing(32.4, 1000));
   handlers.message_end({ message: { role: "assistant", stopReason: "stop" } }); end(90000);
-  assert("final server timing replaces the estimate without a marker", gen() === 32.4 && !/Gen\s+~/.test(line()), true);
+  assert("final server timing replaces the estimate without a marker",
+    gen() === 32.4 && genMark() === "", true);
 
   // A missing earlier request must not suppress this response's live rate.
   begin(); native();
@@ -359,7 +382,8 @@ try {
   await Bun.sleep(110);
   assert("current server live timing is visible despite missing earlier request timing", gen(), 27.1);
   handlers.message_end({ message: { role: "assistant", stopReason: "stop" } }); end();
-  assert("settled aggregate still does not pretend missing requests were measured", gen(), null);
+  assert("settled aggregate still does not pretend missing requests were measured",
+    genMark() === "·", true);
 
   begin(); native();
   for (const count of [3, 6, 9, 12]) {
@@ -377,8 +401,28 @@ try {
     await Bun.sleep(25);
   }
   await Bun.sleep(110);
-  assert("intermittent usage cannot leave live Gen blank while output continues", gen()! > 0 && /Gen\s+~/.test(line()), true);
+  assert("intermittent usage cannot leave live Gen blank while output continues",
+    gen()! > 0 && await sawTilde(), true);
   handlers.message_end({ message: { role: "assistant", stopReason: "aborted" } }); end();
+
+  // The estimate marker blinks only while the response is in flight.
+  begin(); native();
+  for (let i = 0; i < 8; i++) { provider({ choices: [{ delta: { content: "x" } }] }); await Bun.sleep(60); }
+  const marks = new Set<string>();
+  const blinkWidths = new Set<number>();
+  for (let i = 0; i < 12; i++) { marks.add(genMark()); blinkWidths.add(line().length); await Bun.sleep(90); }
+  assert("a live estimate blinks while generating", marks.has("~") && marks.has(""), true);
+  assert("blinking keeps the fixed row width", blinkWidths.size, 1);
+  provider(timing(31.2, 1000));
+  handlers.message_end({ message: { role: "assistant", stopReason: "stop" } }); end();
+  const settled = new Set<string>();
+  for (let i = 0; i < 10; i++) { settled.add(genMark()); await Bun.sleep(90); }
+  assert("a server measurement settles the marker steady", settled.size === 1 && settled.has(""), true);
+  begin({ ...ctx, model: { id: "other", baseUrl: origin } }); native({ ...body, model: "other" });
+  provider({ choices: [{ delta: { content: "a" } }] }, "other");
+  await Bun.sleep(110);
+  assert("another model cannot inherit the previous model's generation rate",
+    gen() === null && genMark() === "", true);
 
   // Last Prompt must survive prefill, generation and the next prompt, while a
   // model or server switch must never inherit another endpoint's number.
@@ -398,7 +442,8 @@ try {
   await Bun.sleep(110);
   assert("a newer measurement replaces it", pp(), 400);
   begin();
-  assert("a new prompt keeps the measurement while Gen resets", pp() === 400 && gen() === null, true);
+  assert("a new prompt holds the last generation rate and prompt rate",
+    pp() === 400 && gen() !== null && genMark() === "·", true);
   begin(); native(); provider(timing(30, 1000));
   handlers.message_end({ message: { role: "assistant", stopReason: "stop" } }); end();
   await Bun.sleep(110);
