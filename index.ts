@@ -57,6 +57,12 @@ const STATUS_KEY = "tokenSpeed";
 const PAD_KEY = "00-top-pad";
 // Last Prompt rate below this threshold renders red.
 const SLOW_PROMPT_TPS = 15;
+// ...but only once enough new tokens actually ran through the model to make
+// the rate a throughput measurement. Slot lookup, cache find and first-batch
+// setup cost a fixed amount of time, so a near-full cache hit divides a few
+// tokens by mostly-overhead milliseconds and reports a slow server that is
+// idle-fast. Below this many new tokens the number stays neutral.
+const MEANINGFUL_PROMPT_TOKENS = 100;
 
 // Original pi-token-speed color ladder (stock defaults) for the Gen rate.
 const TPS_THRESHOLDS: Array<[number, string]> = [
@@ -165,7 +171,10 @@ function formatPrompt(s: PpStats | null): string {
   let rate = pad(PLACEHOLDER, PROMPT_WIDTH);
   if (s && s.pp !== null) {
     rate = formatRate(s.pp, PROMPT_WIDTH);
-    if (shown(s.pp) < SLOW_PROMPT_TPS) rate = colorHex(rate, "#ff4444");
+    // An unknown count cannot prove the sample was too small, so it stays
+    // eligible: a reported rate this low is worth seeing in red either way.
+    const measurable = s.newTokens === null || s.newTokens >= MEANINGFUL_PROMPT_TOKENS;
+    if (measurable && shown(s.pp) < SLOW_PROMPT_TPS) rate = colorHex(rate, "#ff4444");
   }
 
   let pct = PLACEHOLDER;

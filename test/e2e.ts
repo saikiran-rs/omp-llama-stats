@@ -75,6 +75,16 @@ const number = (pattern: RegExp) => {
 };
 const gen = () => number(/Gen\s+~?\s*([\d.]+) t\/s/);
 const pp = () => number(/Last Prompt\s+([\d.]+) t\/s/);
+const RED = "\x1b[38;2;255;68;68m";
+const promptIsRed = () => {
+  const at = statuses.tokenSpeed.indexOf("Last Prompt");
+  return at >= 0 && statuses.tokenSpeed.slice(at, at + 30).includes(RED);
+};
+/** Prompt-only timings: a server rate, its counts, and its milliseconds. */
+const ppTiming = (n: number | null, ms: number, rate: number, cache: number | null = null) => ({
+  timings: { predicted_per_second: 30, predicted_ms: 1000,
+    prompt_n: n, prompt_ms: ms, prompt_per_second: rate, ...(cache === null ? {} : { cache_n: cache }) },
+});
 let passed = 0;
 function assert(label: string, actual: unknown, expected: unknown) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -145,6 +155,22 @@ try {
   begin(); await post("/no-cache/chat/completions"); end();
   assert("absent cache_n is unknown, not zero", /Cache\s+--% \|\s+10 new \/\s+-- cached/.test(line()), true);
   assert("prompt count/time is a server-measured fallback", pp(), 10);
+  // Red must mean a slow server, never arithmetic on a nearly cached prompt:
+  // fixed prefill costs dominate the milliseconds of a handful of new tokens.
+  assert("a tiny cached remainder is never accused of being slow", pp() === 10 && !promptIsRed(), true);
+  scripts.set("/slow/chat/completions", [sse(ppTiming(null, 90000, 10, 0)), DONE]);
+  begin(); await post("/slow/chat/completions"); end();
+  assert("an uncounted slow rate stays red", promptIsRed(), true);
+  scripts.set("/big-slow/chat/completions", [sse(ppTiming(900, 90000, 10, 27000)), DONE]);
+  begin(); await post("/big-slow/chat/completions"); end();
+  assert("a genuinely slow large prefill is red at a high cache hit",
+    pp() === 10 && /Cache\s+96\.8%/.test(line()) && promptIsRed(), true);
+  scripts.set("/tiny/chat/completions", [sse(ppTiming(99, 99000, 1, 32000)), DONE]);
+  begin(); await post("/tiny/chat/completions"); end();
+  assert("99 new tokens cannot trip the warning", pp() === 1 && !promptIsRed(), true);
+  scripts.set("/edge/chat/completions", [sse(ppTiming(100, 100000, 1, 32000)), DONE]);
+  begin(); await post("/edge/chat/completions"); end();
+  assert("100 new tokens is a measurement", pp() === 1 && promptIsRed(), true);
   scripts.set("/fullcache/chat/completions", [sse(timing(30, 1000, { prompt_n: 0, cache_n: 26000, prompt_per_second: 0 })), DONE]);
   begin(); await post("/fullcache/chat/completions"); end();
   assert("fully cached prompts have no prefill rate", pp() === null && /Cache 100.0% \|\s+0 new \/\s+26K cached/.test(line()), true);

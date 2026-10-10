@@ -13,10 +13,11 @@ counts.
 **Server timing is authoritative.** The final value comes from the server;
 when the server omits live timing, a live delivery estimate is prefixed with
 `~` (for example, `Gen ~32.1 t/s`). Version 0.5.1 restores this live display
-for proxies that send `timings` only in the final chunk, and version 0.5.2
+for proxies that send `timings` only in the final chunk, version 0.5.2
 keeps the last prompt measurement visible while the next one is still being
-computed. Neither ever learns a multiplier from a previous response or counts
-Pi UI events as tokens.
+computed, and version 0.5.3 stops coloring a nearly cached prompt red. None of
+them ever learns a multiplier from a previous response or counts Pi UI events
+as tokens.
 
 - **Gen:** the server's `timings.predicted_per_second`. Live values are the
   server's cumulative measurements, updated with `timings_per_token: true`.
@@ -40,7 +41,13 @@ Pi UI events as tokens.
   every response. A measurement is never inherited by a different model or
   server, and a new session starts blank. Time to first token includes
   queueing, network delivery, cache lookup, and decoding; it is never labeled
-  prompt-processing speed.
+  prompt-processing speed. It is only called slow once at least 100 new tokens
+  ran through the model: slot lookup, cache find and first-batch setup cost a
+  fixed amount of time, so a 99%-cached turn divides a handful of tokens by
+  mostly-overhead milliseconds and reports a low rate for a server that is
+  otherwise fast. The red warning therefore keys on the size of the sample
+  rather than the cache percentage, which would also hide a large prefill that
+  genuinely stalled.
 - **Cache:** `cache_n / (prompt_n + cache_n)`. When timing fields are absent,
   `usage.prompt_tokens_details.cached_tokens` and `usage.prompt_tokens` can
   still establish the exact cache/new token counts.
@@ -158,7 +165,8 @@ are integers; larger counts use K/M abbreviations.
 Unknown values remain `--`, including absent cache counts. A fully cached
 prompt shows a 100.0% cache hit and no processing rate. Gen colors are red
 below 15, orange from 15, green from 30, and blue from 45 t/s. Prompt rates
-below 15 t/s are red. Color thresholds use the displayed rounded value.
+below 15 t/s are red once at least 100 new tokens were processed; see
+**Last Prompt**. Color thresholds use the displayed rounded value.
 
 Both metrics share one status key. omp renders a separate row per status key;
 a blank `00-top-pad` entry adds space above the stats row. Pi joins entries
@@ -176,8 +184,8 @@ one-count-per-frame behavior, server rate fidelity, cumulative snapshots, weight
 multi-request averages, missing/invalid measurements, cache counts, prefill
 progress, cancellation, stale responses, session isolation, Request-object
 bodies, a Last Prompt value that survives the requests and prompts it is
-waiting to be replaced by, model and server switches, response-byte
-preservation, and fetch teardown.
+waiting to be replaced by, model and server switches, the slow-prompt color
+gate, response-byte preservation, and fetch teardown.
 
 ## License
 
