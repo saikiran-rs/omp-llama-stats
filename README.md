@@ -13,8 +13,10 @@ counts.
 **Server timing is authoritative.** The final value comes from the server;
 when the server omits live timing, a live delivery estimate is prefixed with
 `~` (for example, `Gen ~32.1 t/s`). Version 0.5.1 restores this live display
-for proxies that send `timings` only in the final chunk. It never learns a
-multiplier from a previous response or counts Pi UI events as tokens.
+for proxies that send `timings` only in the final chunk, and version 0.5.2
+keeps the last prompt measurement visible while the next one is still being
+computed. Neither ever learns a multiplier from a previous response or counts
+Pi UI events as tokens.
 
 - **Gen:** the server's `timings.predicted_per_second`. Live values are the
   server's cumulative measurements, updated with `timings_per_token: true`.
@@ -31,9 +33,14 @@ multiplier from a previous response or counts Pi UI events as tokens.
   and prefill. Repeated timing snapshots and `[DONE]` followed by EOF are
   counted once.
 - **Last Prompt:** `timings.prompt_per_second`, or the server's
-  `prompt_n / prompt_ms` when the rate field is absent. It belongs to the
-  latest request. Time to first token includes queueing, network delivery,
-  cache lookup, and decoding; it is never labeled prompt-processing speed.
+  `prompt_n / prompt_ms` when the rate field is absent. It is the most recent
+  measurement made by the current model and endpoint, so it stays on screen
+  while the next request is prefilling and generating — servers that report
+  timings only on the terminal chunk would otherwise blank it for the whole of
+  every response. A measurement is never inherited by a different model or
+  server, and a new session starts blank. Time to first token includes
+  queueing, network delivery, cache lookup, and decoding; it is never labeled
+  prompt-processing speed.
 - **Cache:** `cache_n / (prompt_n + cache_n)`. When timing fields are absent,
   `usage.prompt_tokens_details.cached_tokens` and `usage.prompt_tokens` can
   still establish the exact cache/new token counts.
@@ -126,7 +133,10 @@ endpoint when supplied by the host. Such hosts cannot distinguish a side
 request using that same model and endpoint; use a host with native provider
 hooks when running concurrent requests in the same process.
 
-A new prompt or session clears measurements. Request records are tagged with
+A new prompt clears generation measurements; a new session clears every
+measurement, including the retained prompt rate. Each prompt measurement
+carries the model and endpoint that produced it, so switching either hides the
+old number before a frame can be mistaken for the new server's. Request records are tagged with
 a generation number, so late responses from an earlier prompt cannot overwrite
 current statistics. Full-session `usage.output` and tool-result usage never
 enter the speed calculation.
@@ -165,7 +175,9 @@ callbacks. It covers positive live Gen with end-only timing, estimate markers,
 one-count-per-frame behavior, server rate fidelity, cumulative snapshots, weighted
 multi-request averages, missing/invalid measurements, cache counts, prefill
 progress, cancellation, stale responses, session isolation, Request-object
-bodies, response-byte preservation, and fetch teardown.
+bodies, a Last Prompt value that survives the requests and prompts it is
+waiting to be replaced by, model and server switches, response-byte
+preservation, and fetch teardown.
 
 ## License
 

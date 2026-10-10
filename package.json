@@ -1,6 +1,6 @@
 {
   "name": "omp-llama-stats",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Server-measured Gen / Last Prompt speed and prompt-cache stats for oh-my-pi and pi",
   "license": "MIT",
   "author": {

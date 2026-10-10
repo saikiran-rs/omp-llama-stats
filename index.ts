@@ -13,6 +13,7 @@ interface PpStats {
 }
 interface RequestStats {
   epoch: number;
+  target: string;
   gen: { rate: number; ms: number | null } | null;
   prompt: PpStats | null;
   hasFetchObserver: boolean;
@@ -33,6 +34,9 @@ const LLAMA_HOST: string | null =
 let uiRef: UiRef | null = null;
 let hasUI = false;
 let ppStats: PpStats | null = null;
+// The endpoint and model that produced ppStats. Prompt speed describes that
+// server, so it is retained across prompts until a measurement replaces it.
+let ppTarget = "";
 let epoch = 0;
 let promptActive = false;
 let activeModel: { id?: string; baseUrl?: string } | undefined;
@@ -240,9 +244,56 @@ function renderStatus(force = false): void {
 function current(r: RequestStats): boolean {
   return r.epoch === epoch && requests.includes(r);
 }
-function newRequest(): RequestStats {
+/** Identity of what a prompt measurement describes; "" when unknowable. */
+function targetId(model: unknown, host: string | null): string {
+  return host ? `${typeof model === "string" && model ? model : "?"}@${host}` : "";
+}
+function hostOf(baseUrl: string | undefined): string | null {
+  if (!baseUrl) return null;
+  try { return new URL(baseUrl).host; } catch { return null; }
+}
+/** An unknown endpoint on either side cannot prove a switch happened. */
+function sameTarget(a: string, b: string): boolean {
+  return !a || !b || a === b;
+}
+
+/**
+ * The newest request owns the Last Prompt slot. Its measurement replaces the
+ * displayed one; until a measurement arrives the previous one stays visible,
+ * because llama.cpp-class servers report prompt timings on the terminal chunk
+ * and a blank slot would otherwise flicker for all of prefill and generation.
+ * Numbers from a different server or model are not predecessors.
+ */
+function applyPrompt(r: RequestStats): void {
+  if (requests.at(-1) !== r) return;
+  if (r.prompt) {
+    ppStats = r.prompt;
+    ppTarget = r.target;
+    return;
+  }
+  if (ppStats && !sameTarget(ppTarget, r.target)) {
+    ppStats = null;
+    ppTarget = "";
+  }
+}
+
+/**
+ * A model or endpoint switch invalidates the retained measurement as soon as
+ * the host reports the new model, before its number can be shown as though it
+ * described the new server.
+ */
+function retargetPrompt(): void {
+  if (!ppStats) return;
+  const next = targetId(activeModel?.id, hostOf(activeModel?.baseUrl));
+  if (!sameTarget(ppTarget, next)) {
+    ppStats = null;
+    ppTarget = "";
+  }
+}
+
+function newRequest(target = ""): RequestStats {
   const r: RequestStats = {
-    epoch, gen: null, prompt: null, finished: false, failed: false, hasFetchObserver: false,
+    epoch, target, gen: null, prompt: null, finished: false, failed: false, hasFetchObserver: false,
     live: { firstAt: null, frames: 0, firstTokens: null, tokens: null, cumulativeUsage: false },
   };
   requests.push(r);
@@ -257,10 +308,15 @@ function reset(): void {
   requests = [];
   nativeRequest = null;
   nativePayload = null;
-  ppStats = null;
   if (renderTimer) clearTimeout(renderTimer);
   renderTimer = null;
   clearWorking();
+}
+/** A new session can point at another server and model, so nothing carries over. */
+function newSession(): void {
+  reset();
+  ppStats = null;
+  ppTarget = "";
 }
 
 function isLocalHost(hostname: string): boolean {
@@ -405,9 +461,7 @@ function observe(r: RequestStats, chunk: any): void {
       } else uiRef.setWorkingMessage();
     }
   }
-  // Last Prompt always belongs to the newest request, even if it reports no
-  // prompt data. This prevents a previous server's numbers surviving a switch.
-  if (requests.at(-1) === r) ppStats = r.prompt;
+  applyPrompt(r);
   renderStatus();
 }
 function finish(r: RequestStats, failed = false): void {
@@ -415,10 +469,8 @@ function finish(r: RequestStats, failed = false): void {
   r.finished = true;
   r.failed = failed;
   if (failed) { r.gen = null; r.prompt = null; }
-  if (requests.at(-1) === r) {
-    ppStats = r.prompt;
-    clearWorking();
-  }
+  applyPrompt(r);
+  if (requests.at(-1) === r) clearWorking();
   renderStatus(true);
 }
 
@@ -481,7 +533,8 @@ export default function (pi: ExtensionAPI) {
   globalState[key] = true;
   const originalFetch = globalThis.fetch;
   const patched = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    if (!promptActive || llamaHost(input) === null) return originalFetch(input, init);
+    const host = promptActive ? llamaHost(input) : null;
+    if (host === null) return originalFetch(input, init);
     const request = input instanceof Request ? input : null;
     const payload = parsePayload(init?.body ?? (request ? await request.clone().text() : null));
     if (!payload?.stream || (payload.n !== undefined && payload.n !== 1)) return originalFetch(input, init);
@@ -492,6 +545,7 @@ export default function (pi: ExtensionAPI) {
         return originalFetch(input, init);
       }
       r = nativeRequest;
+      if (!r.target) r.target = targetId(payload.model, host);
     } else {
       // Legacy hosts lack session-scoped provider callbacks. Restrict their
       // hook to the active model and endpoint whenever the context supplies it.
@@ -506,7 +560,7 @@ export default function (pi: ExtensionAPI) {
           }
         } catch { return originalFetch(input, init); }
       }
-      r = newRequest();
+      r = newRequest(targetId(payload.model, host));
     }
     const nextInit = { ...init, body: JSON.stringify(enableProgress(payload)) };
     try {
@@ -527,7 +581,7 @@ export default function (pi: ExtensionAPI) {
     hasUI = ctx.hasUI;
     promptActive = false;
     activeModel = ctx.model;
-    reset();
+    newSession();
     renderStatus(true);
     if (hasUI) ctx.ui.setStatus(PAD_KEY, " ");
   });
@@ -536,6 +590,7 @@ export default function (pi: ExtensionAPI) {
     hasUI = ctx.hasUI;
     activeModel = ctx.model;
     reset();
+    retargetPrompt();
     promptActive = true;
     renderStatus(true);
     if (hasUI) ctx.ui.setStatus(PAD_KEY, " ");
@@ -545,7 +600,8 @@ export default function (pi: ExtensionAPI) {
     nativeHooks = true;
     const payload = event.payload;
     nativePayload = payload && typeof payload === "object" ? payload : null;
-    nativeRequest = newRequest();
+    nativeRequest = newRequest(targetId((nativePayload as { model?: unknown } | null)?.model,
+      hostOf(activeModel?.baseUrl)));
     if (nativePayload && (nativePayload as { stream?: boolean }).stream && activeModel?.baseUrl &&
         llamaHost(`${activeModel.baseUrl.replace(/\/$/, "")}/chat/completions`) !== null) {
       const next = enableProgress(nativePayload);
@@ -582,7 +638,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_end", (_event, ctx) => { if (ctx.hasUI) ctx.ui.setWorkingMessage(); });
   pi.on("session_shutdown", () => {
     promptActive = false;
-    reset();
+    newSession();
     if (globalThis.fetch === patched) {
       globalThis.fetch = originalFetch;
       delete globalState[key];

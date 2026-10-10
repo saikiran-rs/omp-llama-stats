@@ -8,6 +8,9 @@ let working: string | undefined;
 let workingThrows = false;
 const ctx = {
   hasUI: true,
+  // Pi hands the active model to the hooks; the endpoint is what separates one
+  // server's measurements from another's.
+  model: { id: "m", baseUrl: "" },
   ui: {
     setStatus(k: string, v?: string) { statuses[k] = v ?? ""; },
     setWorkingMessage(v?: string) {
@@ -36,13 +39,15 @@ const server = Bun.serve({
     return new Response(new ReadableStream({
       start(controller) {
         for (const data of script) controller.enqueue(new TextEncoder().encode(data));
-        if (path !== "/cancel/chat/completions") controller.close();
+        if (path !== "/cancel/chat/completions" && path !== "/open/chat/completions") controller.close();
       },
       cancel() { cancelled = true; },
     }), { headers: { "content-type": "text/event-stream" } });
   },
 });
 const url = (path: string) => `http://127.0.0.1:${server.port}${path}`;
+const origin = url("");
+ctx.model.baseUrl = origin;
 const sse = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
 const DONE = "data: [DONE]\n\n";
 const timing = (rate: number, ms: number, extra: any = {}) => ({
@@ -61,7 +66,7 @@ async function post(path: string, payload = body) {
   return response.text();
 }
 function native(payload: any = body) { handlers.before_provider_request({ payload }); }
-function provider(data: any) { handlers.provider_stream_event({ model: "m", data }); }
+function provider(data: any, model = "m") { handlers.provider_stream_event({ model, data }); }
 const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
 const line = () => strip(statuses.tokenSpeed);
 const number = (pattern: RegExp) => {
@@ -122,9 +127,16 @@ try {
   begin(); await post("/repeat/chat/completions"); await post("/usage/chat/completions"); end();
   assert("missing timing for one request makes aggregate Gen unknown", gen(), null);
 
+  // Servers that report prompt timings on the terminal chunk must not blank the
+  // slot for the whole of every generation: it holds the last measurement made
+  // by this endpoint until a newer one replaces it.
   scripts.set("/missing/chat/completions", [sse({ choices: [{ delta: { content: "x" } }] }), DONE]);
+  begin(); await post("/repeat/chat/completions"); end();
   begin(); await post("/missing/chat/completions"); end();
-  assert("a response with no stats cannot retain earlier prompt data", line(), placeholder);
+  assert("a stats-less response holds the last measurement from its server", pp(), 100);
+  handlers.session_start({}, ctx);
+  begin(); await post("/missing/chat/completions"); end();
+  assert("a new session has no prompt measurement to hold", line(), placeholder);
 
   scripts.set("/cache/chat/completions", [sse(timing(46.65, 20000, { prompt_n: 57, cache_n: 23, prompt_per_second: 57 })), DONE]);
   begin(); await post("/cache/chat/completions"); end();
@@ -176,8 +188,25 @@ try {
   await (await fetch(request)).text(); end();
   assert("Request-object bodies are observed and progress-enabled", gen() === 30 && bodies.at(-1).timings_per_token === true, true);
 
+  handlers.session_start({}, ctx);
   begin(); await post("/error/chat/completions"); end();
   assert("HTTP failure cannot show previous stats", line(), placeholder);
+  begin(); await post("/tail/chat/completions"); end();
+  begin(); await post("/error/chat/completions"); end();
+  assert("a failure keeps the endpoint's last prompt measurement", pp(), 100);
+  // The reported symptom: a response that has not reached its terminal timing
+  // chunk used to blank Last Prompt for all of its prefill and generation.
+  scripts.set("/open/chat/completions", [sse({ choices: [{ delta: { content: "a" } }] })]);
+  begin();
+  const inflight = await fetch(url("/open/chat/completions"), {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const inflightReader = inflight.body!.getReader();
+  await inflightReader.read();
+  await Bun.sleep(110);
+  assert("an in-flight response keeps the last prompt measurement on screen",
+    pp() === 100 && /Last Prompt\s+100\.0 t\/s/.test(line()), true);
+  await inflightReader.cancel(); end();
   begin();
   const abort = new AbortController();
   const res = await fetch(url("/cancel/chat/completions"), { ...init, signal: abort.signal });
@@ -279,6 +308,43 @@ try {
   await Bun.sleep(110);
   assert("intermittent usage cannot leave live Gen blank while output continues", gen()! > 0 && /Gen\s+~/.test(line()), true);
   handlers.message_end({ message: { role: "assistant", stopReason: "aborted" } }); end();
+
+  // Last Prompt must survive prefill, generation and the next prompt, while a
+  // model or server switch must never inherit another endpoint's number.
+  begin(); native();
+  provider({ timings: { predicted_per_second: 30, predicted_ms: 1000, prompt_n: 200,
+    prompt_ms: 1000, prompt_per_second: 200, cache_n: 50 } });
+  handlers.message_end({ message: { role: "assistant", stopReason: "toolUse" } });
+  await Bun.sleep(110);
+  assert("a measured prefill fills the Last Prompt slot",
+    pp() === 200 && /Cache\s+20\.0% \|\s+200 new \/\s+50 cached/.test(line()), true);
+  native(); provider({ choices: [{ delta: { content: "b" } }] });
+  await Bun.sleep(110);
+  assert("an in-flight request does not blank the last measurement", pp(), 200);
+  provider({ timings: { predicted_per_second: 30, predicted_ms: 1000, prompt_n: 400,
+    prompt_ms: 2000, prompt_per_second: 400, cache_n: 0 } });
+  handlers.message_end({ message: { role: "assistant", stopReason: "stop" } }); end();
+  await Bun.sleep(110);
+  assert("a newer measurement replaces it", pp(), 400);
+  begin();
+  assert("a new prompt keeps the measurement while Gen resets", pp() === 400 && gen() === null, true);
+  begin(); native(); provider(timing(30, 1000));
+  handlers.message_end({ message: { role: "assistant", stopReason: "stop" } }); end();
+  await Bun.sleep(110);
+  assert("the measurement returns with its own server", pp(), 100);
+  begin({ ...ctx, model: { id: "other", baseUrl: origin } }); native({ ...body, model: "other" });
+  provider({ choices: [{ delta: { content: "a" } }] }, "other");
+  await Bun.sleep(110);
+  assert("another model cannot inherit the previous model's prompt rate",
+    pp() === null && /-- new/.test(line()), true);
+  begin(); native(); provider(timing(30, 1000));
+  handlers.message_end({ message: { role: "assistant", stopReason: "stop" } }); end();
+  await Bun.sleep(110);
+  assert("the slot refills for its own server", pp(), 100);
+  begin({ ...ctx, model: { id: "m", baseUrl: `http://127.0.0.2:${server.port}` } }); native();
+  provider({ choices: [{ delta: { content: "a" } }] });
+  await Bun.sleep(110);
+  assert("another server cannot inherit the previous server's prompt rate", pp() === null, true);
 
   // A stats/UI failure must never corrupt the model's bytes.
   begin(); native(); workingThrows = true;
