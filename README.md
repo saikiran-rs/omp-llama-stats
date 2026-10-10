@@ -18,9 +18,10 @@ keeps the last prompt measurement visible while the next one is still being
 computed, version 0.5.3 stops coloring a nearly cached prompt red, and version
 0.5.4 publishes it as soon as prefill finishes instead of waiting for the end
 of the response, and version 0.6.0 stops generation speed blanking between
-requests and prompts, marking a held value `·` and blinking the live estimate.
-None of them ever learns a multiplier from a previous response or counts Pi UI
-events as tokens.
+requests and prompts. Version 0.7.0 makes that marker a steady `~` that means
+only "decoding now" and disappears without moving the digits when the response
+settles. None of them ever learns a multiplier from a previous response or
+counts Pi UI events as tokens.
 
 - **Gen:** the server's `timings.predicted_per_second`. When nothing has been
   measured yet on this endpoint it shows `--`; afterwards it never blanks, see
@@ -66,24 +67,28 @@ events as tokens.
   never published as a measurement — only the frame that reports the prefill
   complete.
 
-A marker says where the generation number came from:
+One marker says whether the generation number is still moving:
 
 | Shows | Meaning |
 | --- | --- |
-| `Gen 34.9 t/s` | this response, measured by the server |
-| `Gen ~34.9 t/s` | this response, live delivery estimate — the `~` **blinks while generating** |
-| `Gen ·34.9 t/s` | **held**: the last rate this endpoint measured, nothing current yet |
+| `Gen ~34.9 t/s` | a response is **decoding now**, so the number is provisional — the server's measurement of this answer, a live delivery estimate, or briefly a held rate while the current response has measured nothing |
+| `Gen 34.9 t/s` | settled: nothing is decoding, and this is the last rate the endpoint's measured responses produced |
 
-Only a session's first response can show `--` for Gen, and only until it is
-measured: before two generated frames establish a live interval, the line holds
-the previous measurement instead of blanking. Between tool round trips, at the
-start of a new prompt, and after an aborted or unmeasured request, the held
-rate shows with `·`. A model or endpoint switch and a new session clear it, so a
-number is never inherited by a different server. While streaming, the current
-response's rate is shown even if an earlier tool round trip lacked timing. The
-final value is `--` only when nothing has ever been measured here: a server
-without timing fields (e.g. many vLLM deployments and hosted APIs) supplies
-token counts but cannot
+The marker replaces a digit slot and toggles only between `~` and a figure
+space, so the digits never shift and the row never jumps as decoding starts and
+stops. It does not blink: an always-visible status line flickering is noise, and
+pi rebuilds styles through its theme layer while omp may strip ANSI, so an
+attribute-based blink could silently stop signalling at all.
+
+Only a session's first response can show `--` for Gen, and only until something
+is measured: after that the line holds the last real rate instead of blanking
+between tool round trips, at the start of a new prompt, and after an aborted or
+unmeasured request. A model or endpoint switch and a new session clear the held
+rate, so a number is never inherited by a different server. While streaming, the
+current response's rate is shown even if an earlier tool round trip lacked
+timing. The final value is `--` only when nothing has ever been measured here: a
+server without timing fields (e.g. many vLLM deployments and hosted APIs)
+supplies token counts but cannot
 supply exact speed through standard OpenAI usage fields. Generation is also
 unknown if a prompt includes a request with missing timings, fails, or is
 cancelled, so its aggregate is not reported; the held rate stays visible. A
@@ -168,9 +173,10 @@ hooks when running concurrent requests in the same process.
 
 A new prompt clears the *live* generation aggregate; a new session clears
 every measurement. Both metrics then keep showing the last value their endpoint
-measured, marked `·` for generation, until a newer one replaces it. Each measurement
-carries the model and endpoint that produced it, so switching either hides the
-old number before a frame can be mistaken for the new server's. Request records are tagged with
+measured, marked `~` while a response is decoding, until a newer one replaces
+it. Each measurement carries the model and endpoint that produced it, so
+switching either hides the old number before a frame can be mistaken for the new
+server's. Request records are tagged with
 a generation number, so late responses from an earlier prompt cannot overwrite
 current statistics. Full-session `usage.output` and tool-result usage never
 enter the speed calculation.
@@ -189,13 +195,9 @@ rate 6, cache percentage 5, and token counts 5. Large rates drop their decimal
 when needed; extreme values can exceed the slot. Token counts below 1000
 are integers; larger counts use K/M abbreviations.
 
-Unknown values remain `--`, including absent cache counts. Both markers consume
-a digit of their slot, so `Gen ~34.9` and `Gen ·34.9` occupy exactly the width
-of `Gen 34.9` and the row never reflows while the `~` blinks. The blink is a
-toggled character re-rendered every 450 ms, deliberately not the ANSI blink
-attribute: pi rebuilds styles through its theme layer, omp may strip ANSI, and
-Terminal.app ignores SGR 5, so an attribute-based blink would silently stop
-signalling. A fully cached
+Unknown values remain `--`, including absent cache counts. The generation marker
+consumes a digit of its slot, so `Gen ~34.9` occupies exactly the width of
+`Gen 34.9` and the row cannot reflow as decoding starts and stops. A fully cached
 prompt shows a 100.0% cache hit and no processing rate. Gen colors are red
 below 15, orange from 15, green from 30, and blue from 45 t/s. Prompt rates
 below 15 t/s are red once at least 100 new tokens were processed; see
@@ -219,8 +221,8 @@ progress, cancellation, stale responses, session isolation, Request-object
 bodies, a Last Prompt value that survives the requests and prompts it is
 waiting to be replaced by, model and server switches, the slow-prompt color
 gate, a prompt measurement published at the end of prefill and refined by the
-terminal timings, the held and blinking generation markers, response-byte
-preservation, and fetch teardown.
+terminal timings, the decoding marker and the held generation rate,
+response-byte preservation, and fetch teardown.
 
 ## License
 

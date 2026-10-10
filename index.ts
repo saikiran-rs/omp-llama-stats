@@ -162,37 +162,20 @@ function shown(v: number): number {
 }
 
 /**
- * Rate slots. `~` marks a live delivery estimate for the response in flight and
- * blinks while it holds; `·` marks a held value from an earlier response on the
- * same endpoint, which stays steady. Both consume a digit of the slot, so the
- * row width never changes. A bare number is the server's own measurement of the
- * current response.
+ * Rate slot. `~` means the response is still decoding, so the number is
+ * provisional: the server's own measurement for this answer, a live delivery
+ * estimate, or a held rate for a response that has not measured anything yet.
+ * Once decoding settles the marker becomes a figure space, so the digits never
+ * move and the row never jumps. The marker is steady on purpose: a blinking
+ * always-visible status line is noise, and pi rebuilds styles through its theme
+ * layer while omp may strip ANSI, so an attribute-based blink could silently
+ * stop signalling.
  */
-function formatGen(g: { rate: number | null; mode: GenMode }): string {
+function formatGen(g: { rate: number | null; inFlight: boolean }): string {
   if (g.rate === null) return pad(PLACEHOLDER, GEN_WIDTH);
-  const mark = g.mode === "estimate" ? (blinkOn ? "~" : FIGURE_SPACE) : g.mode === "held" ? "·" : "";
-  const text = mark + formatRate(g.rate, GEN_WIDTH - mark.length);
+  const mark = g.inFlight ? "~" : FIGURE_SPACE;
+  const text = mark + formatRate(g.rate, GEN_WIDTH - 1);
   return colorHex(text, tpsColor(shown(g.rate)));
-}
-
-// Blinking is done by re-rendering, not with the ANSI blink attribute: pi
-// rebuilds styles through its theme layer and omp may strip ANSI, and Terminal
-// app ignores SGR 5 outright. A toggled character survives all three.
-const BLINK_MS = 450;
-let blinkOn = true;
-let blinkTimer: ReturnType<typeof setTimeout> | null = null;
-function syncBlink(mode: GenMode, showing: boolean): void {
-  if (mode === "estimate" && showing) {
-    blinkTimer ??= setTimeout(() => {
-      blinkTimer = null;
-      blinkOn = !blinkOn;
-      renderStatus(true);
-    }, BLINK_MS);
-  } else if (blinkTimer) {
-    clearTimeout(blinkTimer);
-    blinkTimer = null;
-    blinkOn = true;
-  }
 }
 
 function formatPrompt(s: PpStats | null): string {
@@ -227,9 +210,6 @@ function positive(v: unknown): number | null {
   return isNum(v) && v > 0 ? v : null;
 }
 
-/** Where a displayed generation rate came from. */
-type GenMode = "live" | "estimate" | "held";
-
 /** Server rates weighted by server decode duration, with no missing requests. */
 function generationRate(): number | null {
   if (!requests.length || requests.some((r) => r.failed || r.gen === null)) return null;
@@ -245,10 +225,10 @@ function generationRate(): number | null {
 }
 
 /** Live refers to the current response, not earlier tool round trips. */
-function displayedGeneration(): { rate: number | null; mode: GenMode } {
+function displayedGeneration(): { rate: number | null; inFlight: boolean } {
   const active = requests.at(-1);
   if (active && !active.finished && !active.failed) {
-    if (active.gen) return { rate: active.gen.rate, mode: "live" };
+    if (active.gen) return { rate: active.gen.rate, inFlight: true };
     const live = active.live;
     if (live.firstAt !== null && live.frames >= 2) {
       // A half-second minimum smooths bursts from a proxy or speculative decode.
@@ -256,15 +236,15 @@ function displayedGeneration(): { rate: number | null; mode: GenMode } {
       const ms = Math.max(performance.now() - live.firstAt, 500);
       const n = live.cumulativeUsage && live.tokens !== null && live.firstTokens !== null
         ? live.tokens - live.firstTokens : live.frames - 1;
-      if (n > 0) return { rate: 1000 * n / ms, mode: "estimate" };
+      if (n > 0) return { rate: 1000 * n / ms, inFlight: true };
     }
-    // Waiting on this response's first measurement: hold the last real one
-    // rather than blanking the line.
-    return { rate: heldGeneration(), mode: "held" };
+    // Decoding, but this response has measured nothing yet: hold the last real
+    // rate, still marked in flight because it says nothing about this answer.
+    return { rate: heldGeneration(), inFlight: true };
   }
   const rate = generationRate();
-  if (rate !== null) return { rate, mode: "live" };
-  return { rate: heldGeneration(), mode: "held" };
+  if (rate !== null) return { rate, inFlight: false };
+  return { rate: heldGeneration(), inFlight: false };
 }
 
 /**
@@ -303,8 +283,7 @@ function renderStatus(force = false): void {
     const gen = displayedGeneration();
     uiRef.setStatus(STATUS_KEY,
       ` ⚡ Gen ${formatGen(gen)} t/s | Last Prompt ${formatPrompt(ppStats)}`);
-    syncBlink(gen.mode, gen.rate !== null);
-  } catch { syncBlink("live", false); }
+  } catch {}
 }
 function current(r: RequestStats): boolean {
   return r.epoch === epoch && requests.includes(r);
@@ -375,9 +354,6 @@ function reset(): void {
   nativePayload = null;
   if (renderTimer) clearTimeout(renderTimer);
   renderTimer = null;
-  if (blinkTimer) clearTimeout(blinkTimer);
-  blinkTimer = null;
-  blinkOn = true;
   clearWorking();
 }
 /** A new session can point at another server and model, so nothing carries over. */
