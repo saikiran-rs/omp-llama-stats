@@ -22,15 +22,12 @@ const ctx = {
 };
 const handlers: Record<string, (e: any, ctx?: any) => any> = {};
 const pristineFetch = globalThis.fetch;
-ext({ on: (e: string, fn: any) => { handlers[e] = fn; } } as any);
-const ours = globalThis.fetch;
 
 const scripts = new Map<string, string[]>();
+const streamControllers = new Map<string, ReadableStreamDefaultController<Uint8Array>>();
 const bodies: any[] = [];
 let cancelled = false;
-const server = Bun.serve({
-  port: 0,
-  async fetch(req) {
+async function serve(req: Request) {
     const path = new URL(req.url).pathname;
     bodies.push(JSON.parse(await req.text()));
     if (path === "/error/chat/completions") return new Response("error", { status: 500 });
@@ -38,13 +35,23 @@ const server = Bun.serve({
     if (!script) return new Response("no route", { status: 404 });
     return new Response(new ReadableStream({
       start(controller) {
+        streamControllers.set(path, controller);
         for (const data of script) controller.enqueue(new TextEncoder().encode(data));
-        if (path !== "/cancel/chat/completions" && path !== "/open/chat/completions") controller.close();
+        if (!["/cancel/chat/completions", "/open/chat/completions", "/lifecycle/chat/completions"].includes(path)) controller.close();
       },
       cancel() { cancelled = true; },
     }), { headers: { "content-type": "text/event-stream" } });
-  },
-});
+}
+// Exercise the same Response/SSE streams without opening a socket when the
+// test runner has no loopback permission. HTTP remains the default transport.
+const inMemory = process.env.OMP_LLAMA_STATS_TEST_IN_MEMORY === "1";
+const server = inMemory ? { port: 8123, stop(_force: boolean) {} }
+  : Bun.serve({ port: 0, fetch: serve });
+if (inMemory) globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) =>
+  serve(new Request(input, init))) as typeof fetch;
+const transportFetch = globalThis.fetch;
+ext({ on: (e: string, fn: any) => { handlers[e] = fn; } } as any);
+const ours = globalThis.fetch;
 const url = (path: string) => `http://127.0.0.1:${server.port}${path}`;
 const origin = url("");
 ctx.model.baseUrl = origin;
@@ -302,6 +309,29 @@ try {
   await res.body!.cancel(); end();
   assert("consumer cancellation clears partial stats", held4 !== null && gen() === held4, true);
 
+  // Regression: an intermediate host lifecycle event must not settle a live
+  // SSE response. The wire can keep delivering tokens and final timings later.
+  scripts.set("/live-seed/chat/completions", [sse(timing(70, 1000)), DONE]);
+  begin(); await post("/live-seed/chat/completions"); end();
+  scripts.set("/lifecycle/chat/completions", [sse(timing(70, 1000))]);
+  begin();
+  const continuingStream = await fetch(url("/lifecycle/chat/completions"), init);
+  const continuingReader = continuingStream.body!.getReader();
+  await continuingReader.read();
+  handlers.message_end({ message: { role: "assistant", stopReason: "stop" } });
+  handlers.agent_end({ messages: [{ role: "assistant", content: [], stopReason: "stop" }] });
+  await Bun.sleep(110);
+  assert("an intermediate agent_end cannot remove the live stream marker", genMark(), "~");
+  streamControllers.get("/lifecycle/chat/completions")!.enqueue(new TextEncoder().encode(
+    sse({ choices: [{ delta: { content: "still decoding" } }] }) + sse(timing(35, 2000))));
+  await continuingReader.read();
+  await Bun.sleep(110);
+  assert("timings after an intermediate agent_end still update Gen", [gen(), genMark()], [35, "~"]);
+  streamControllers.get("/lifecycle/chat/completions")!.enqueue(new TextEncoder().encode(DONE));
+  await continuingReader.read();
+  assert("actual stream completion settles the final rate", [gen(), genMark()], [35, ""]);
+  await continuingReader.cancel();
+
   // Capture starts in one prompt; completion after a new prompt must be ignored.
   begin();
   const late = await fetch(url("/repeat/chat/completions"), init);
@@ -316,6 +346,35 @@ try {
   assert("idle requests receive no llama-specific options", bodies[beforeIdle].timings_per_token, undefined);
 
   // Modern Pi: native callbacks work even when its transport bypasses fetch.
+  begin(); native(); provider(timing(70, 1000));
+  handlers.message_end({ message: { role: "assistant", stopReason: "stop" } }); end();
+  assert("the preceding response settles at 70 without a marker", [gen(), genMark()], [70, ""]);
+  // Automatic/queued runs can start with agent_start and no user-prompt hook.
+  handlers.agent_start?.({}, ctx);
+  native();
+  assert("agent_start reactivates telemetry and marks the held 70", [gen(), genMark()], [70, "~"]);
+  for (let i = 0; i < 16; i++) {
+    provider({ choices: [{ delta: { reasoning_content: "thinking" } }] });
+    await Bun.sleep(35);
+  }
+  await Bun.sleep(110);
+  assert("a resumed run replaces the held 70 with a live estimate",
+    gen()! > 0 && gen()! < 50 && genMark() === "~", true);
+  provider(timing(26, 1000));
+  handlers.message_end({ message: { role: "assistant", stopReason: "stop" } }); end();
+  assert("the resumed run settles with its own server rate", [gen(), genMark()], [26, ""]);
+
+  begin(); native(); provider(timing(70, 1000));
+  await Bun.sleep(110);
+  assert("native decoding starts with a marked 70", [gen(), genMark()], [70, "~"]);
+  handlers.agent_end({ messages: [{ role: "assistant", content: [], stopReason: "stop" }] });
+  assert("an intermediate agent_end cannot settle native decoding", [gen(), genMark()], [70, "~"]);
+  provider(timing(35, 2000));
+  await Bun.sleep(110);
+  assert("native telemetry keeps updating after an intermediate agent_end", [gen(), genMark()], [35, "~"]);
+  handlers.message_end({ message: { role: "assistant", stopReason: "stop" } }); end();
+  assert("native message completion settles the final rate", [gen(), genMark()], [35, ""]);
+
   begin(); native();
   provider(timing(25, 4000));
   await Bun.sleep(110); // one trailing status flush
@@ -331,6 +390,35 @@ try {
   native(); await post("/second/chat/completions");
   handlers.message_end({ message: { role: "assistant", stopReason: "stop" } }); end();
   assert("native and fetch observation cannot double-count a request", gen(), 28);
+
+  // The assistant event can precede DONE on hosts that drain the transport
+  // after logical message completion. Fetch still owns its terminal timings.
+  begin(); native();
+  const nativeStream = await fetch(url("/lifecycle/chat/completions"), init);
+  const nativeReader = nativeStream.body!.getReader();
+  await nativeReader.read();
+  handlers.message_end({ message: { role: "assistant", stopReason: "stop" } });
+  handlers.agent_end({ messages: [{ role: "assistant", content: [], stopReason: "stop" }] });
+  assert("message_end cannot settle an observed fetch stream before DONE", genMark(), "~");
+  streamControllers.get("/lifecycle/chat/completions")!.enqueue(new TextEncoder().encode(sse(timing(36, 2000)) + DONE));
+  await nativeReader.read();
+  assert("fetch drains final timings after native message_end", [gen(), genMark()], [36, ""]);
+  await nativeReader.cancel();
+
+  begin(); native(); provider(timing(25, 4000));
+  handlers.message_end({ message: { role: "assistant", stopReason: "toolUse" } });
+  handlers.agent_end({ messages: [], willContinue: true });
+  handlers.agent_start?.({}, ctx);
+  native(); provider(timing(40, 1000));
+  handlers.message_end({ message: { role: "assistant", stopReason: "stop" } }); end();
+  assert("continuing agent loops preserve the weighted prompt aggregate", gen(), 28);
+
+  const beforeAbortedEnd = gen();
+  begin(); native(); provider(timing(70, 1000));
+  handlers.agent_end({ messages: [{ role: "assistant", content: [], stopReason: "aborted" }] });
+  provider(timing(35, 2000));
+  assert("an explicitly aborted agent cannot keep partial telemetry active", [gen(), genMark()], [beforeAbortedEnd, ""]);
+
   begin(); native();
   await post("/repeat/chat/completions");
   await post("/second/chat/completions", { ...body, messages: [{ role: "user", content: "Generate a title" }] });
@@ -483,7 +571,7 @@ try {
   assert("shutdown never clobbers a later fetch wrapper", globalThis.fetch === other, true);
   globalThis.fetch = ours;
   handlers.session_shutdown();
-  assert("shutdown restores the original fetch when on top", globalThis.fetch === pristineFetch, true);
+  assert("shutdown restores the original fetch when on top", globalThis.fetch === transportFetch, true);
   console.log(`ALL ${passed} CHECKS PASS`);
 } finally {
   globalThis.fetch = pristineFetch;

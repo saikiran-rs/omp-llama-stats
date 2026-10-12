@@ -43,6 +43,9 @@ let ppTarget = "";
 let genHeld: { rate: number; target: string } | null = null;
 let epoch = 0;
 let promptActive = false;
+// A host can announce agent_end before its response stream has drained. Keep
+// observing that request until the wire or assistant message actually ends.
+let agentSettled = false;
 let activeModel: { id?: string; baseUrl?: string } | undefined;
 let requests: RequestStats[] = [];
 // Modern Pi exposes session-scoped provider hooks. Match its payload to the
@@ -352,6 +355,7 @@ function reset(): void {
   requests = [];
   nativeRequest = null;
   nativePayload = null;
+  agentSettled = false;
   if (renderTimer) clearTimeout(renderTimer);
   renderTimer = null;
   clearWorking();
@@ -538,6 +542,7 @@ function finish(r: RequestStats, failed = false): void {
   applyPrompt(r);
   if (requests.at(-1) === r) clearWorking();
   holdGeneration();
+  if (agentSettled && requests.every((request) => request.finished)) promptActive = false;
   renderStatus(true);
 }
 
@@ -662,6 +667,21 @@ export default function (pi: ExtensionAPI) {
     renderStatus(true);
     if (hasUI) ctx.ui.setStatus(PAD_KEY, " ");
   });
+  pi.on("agent_start", (_event, ctx) => {
+    // Queued prompts and automatic continuations can start another agent loop
+    // without before_agent_start. Re-arm observation after the previous loop
+    // settled, or every provider/fetch event is ignored and Gen stays held.
+    // The usual before_agent_start -> agent_start path must keep its records.
+    if (promptActive) return;
+    uiRef = ctx.ui;
+    hasUI = ctx.hasUI;
+    activeModel = ctx.model;
+    reset();
+    retargetPrompt();
+    promptActive = true;
+    renderStatus(true);
+    if (hasUI) ctx.ui.setStatus(PAD_KEY, " ");
+  });
   pi.on("before_provider_request", (event) => {
     if (!promptActive) return;
     nativeHooks = true;
@@ -685,7 +705,10 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_end", (event) => {
     const message = event.message;
     if (message.role === "assistant" && nativeRequest) {
-      finish(nativeRequest, message.stopReason === "error" || message.stopReason === "aborted");
+      const failed = message.stopReason === "error" || message.stopReason === "aborted";
+      // A fetch observer can still be draining output and terminal timings
+      // after a host message event. Its DONE/EOF/cancellation owns completion.
+      if (failed || !nativeRequest.hasFetchObserver) finish(nativeRequest, failed);
     }
   });
   pi.on("agent_end", (event) => {
@@ -696,9 +719,13 @@ export default function (pi: ExtensionAPI) {
     const continuing = (event as { willContinue?: boolean }).willContinue === true ||
       (last?.role === "assistant" && last.stopReason !== "aborted" && last.stopReason !== "error" &&
        last.content.some((c) => c.type === "toolCall"));
-    if (!continuing) {
-      promptActive = false;
-      for (const r of requests) if (!r.finished) finish(r, true);
+    agentSettled = !continuing;
+    if (agentSettled) {
+      const failed = last?.stopReason === "aborted" || last?.stopReason === "error";
+      if (failed) for (const r of requests) if (!r.finished) finish(r, true);
+      // An intermediate agent_end must not freeze a still-open response or
+      // remove its ~. Native message_end and fetch completion settle requests.
+      promptActive = requests.some((r) => !r.finished);
     }
     renderStatus(true);
   });

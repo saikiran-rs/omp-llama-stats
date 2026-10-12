@@ -20,12 +20,15 @@ computed, version 0.5.3 stops coloring a nearly cached prompt red, and version
 of the response, and version 0.6.0 stops generation speed blanking between
 requests and prompts. Version 0.7.0 makes that marker a steady `~` that means
 only "decoding now" and disappears without moving the digits when the response
-settles. None of them ever learns a multiplier from a previous response or
+settles. Version 0.7.1 keeps an active response updating if the host emits an
+intermediate `agent_end`, drains final timing chunks after `message_end`, and
+reactivates observation for agent runs that start without a user-prompt hook.
+None of them ever learns a multiplier from a previous response or
 counts Pi UI events as tokens.
 
 - **Gen:** the server's `timings.predicted_per_second`. When nothing has been
   measured yet on this endpoint it shows `--`; afterwards it never blanks, see
-  **Display** for the three markers. Live values are the
+  **Display** for the marker. Live values are the
   server's cumulative measurements, updated with `timings_per_token: true`.
   When those fields are unavailable during streaming, the live estimate uses
   the current response's cumulative completion-token counter if supplied;
@@ -181,6 +184,12 @@ a generation number, so late responses from an earlier prompt cannot overwrite
 current statistics. Full-session `usage.output` and tool-result usage never
 enter the speed calculation.
 
+An intermediate `agent_end` does not settle an open response. The fetch
+observer waits for `[DONE]`, EOF, or cancellation; native-only observation
+waits for the assistant's `message_end`. An explicit error or abort still
+invalidates partial decode timings. This keeps `~` and subsequent timing
+updates active when a host lifecycle notification precedes stream completion.
+
 The fetch observer forwards original response bytes and cancellation. It
 supports split SSE reads, multiline `data:` fields, CRLF, optional spaces,
 and a final event without a newline. Stats/UI failures do not alter model
@@ -211,6 +220,9 @@ on one row. omp may strip ANSI colors.
 
 ```sh
 bun run test
+
+# The same stream checks without opening a loopback socket:
+OMP_LLAMA_STATS_TEST_IN_MEMORY=1 bun run test
 ```
 
 The end-to-end harness uses a loopback HTTP SSE server and native provider
@@ -222,7 +234,8 @@ bodies, a Last Prompt value that survives the requests and prompts it is
 waiting to be replaced by, model and server switches, the slow-prompt color
 gate, a prompt measurement published at the end of prefill and refined by the
 terminal timings, the decoding marker and the held generation rate,
-response-byte preservation, and fetch teardown.
+response-byte preservation, intermediate host lifecycle events during an open
+stream, queued/automatic agent runs, explicit aborts, and fetch teardown.
 
 ## License
 
